@@ -1,0 +1,2 @@
+"""Sous-package `features.users`."""
+

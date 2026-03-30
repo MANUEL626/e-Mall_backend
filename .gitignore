@@ -1,0 +1,9 @@
+.idea
+.idea*
+.venv
+.env
+venv/
+__pycache__
+note
+guide*
+pr_description.md

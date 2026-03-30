@@ -1,0 +1,14 @@
+# Framework web
+fastapi~=0.115.12
+uvicorn
+
+# Pydantic
+pydantic~=2.11.4
+email-validator
+
+# Supabase
+supabase~=2.10.0
+python-dotenv
+
+# HTTP requests (pour renvoi d'email de confirmation)
+requests
