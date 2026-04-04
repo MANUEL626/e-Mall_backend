@@ -1,0 +1,33 @@
+# Dépendances et caches locaux
+.venv
+venv
+__pycache__
+*.py[cod]
+*$py.class
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Secrets et env local (ne jamais les copier dans l’image)
+.env
+.env.*
+!.env.example
+
+# Git / IDE
+.git
+.gitignore
+.idea
+.vscode
+
+# Docker (évite d’invalider le cache inutilement)
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Supabase CLI (migrations utiles en repo mais pas besoin dans l’image API)
+supabase/.temp
+supabase/.branches
+
+# Divers projet
+note
+*.md
