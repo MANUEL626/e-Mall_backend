@@ -4,12 +4,81 @@ Ce fichier peut être importé dans n'importe quel module du projet
 """
 
 import os
+import sys
+from typing import Optional
 
 from dotenv import load_dotenv
 from supabase import Client, ClientOptions, create_client
 
 # Charger les variables d'environnement depuis un fichier .env
 load_dotenv()
+
+
+def _postgrest_use_http2() -> bool:
+    """
+    postgrest-py force httpx en HTTP/2 par défaut ; sur Windows cela provoque souvent
+    httpx.ReadError / WinError 10035 lors des appels à PostgREST (REST Supabase).
+    Par défaut : HTTP/2 désactivé sous Windows, activé ailleurs (comportement proche de l’upstream).
+    Forcer : SUPABASE_HTTP2=1 ou SUPABASE_HTTP2=0.
+    """
+    raw = os.getenv("SUPABASE_HTTP2", "").strip().lower()
+    if raw in ("1", "true", "yes"):
+        return True
+    if raw in ("0", "false", "no"):
+        return False
+    return sys.platform != "win32"
+
+
+def _patch_postgrest_httpx_http2() -> None:
+    """Remplace create_session des clients PostgREST pour contrôler le flag http2 de httpx."""
+    use_http2 = _postgrest_use_http2()
+
+    from postgrest._async.client import AsyncPostgrestClient
+    from postgrest._sync.client import SyncPostgrestClient
+    from postgrest.utils import AsyncClient as PostgrestAsyncClient
+    from postgrest.utils import SyncClient as PostgrestSyncClient
+
+    def _sync_create_session(
+        self: SyncPostgrestClient,
+        base_url: str,
+        headers: dict,
+        timeout,
+        verify: bool = True,
+        proxy: Optional[str] = None,
+    ) -> PostgrestSyncClient:
+        return PostgrestSyncClient(
+            base_url=base_url,
+            headers=headers,
+            timeout=timeout,
+            verify=verify,
+            proxy=proxy,
+            follow_redirects=True,
+            http2=use_http2,
+        )
+
+    def _async_create_session(
+        self: AsyncPostgrestClient,
+        base_url: str,
+        headers: dict,
+        timeout,
+        verify: bool = True,
+        proxy: Optional[str] = None,
+    ) -> PostgrestAsyncClient:
+        return PostgrestAsyncClient(
+            base_url=base_url,
+            headers=headers,
+            timeout=timeout,
+            verify=verify,
+            proxy=proxy,
+            follow_redirects=True,
+            http2=use_http2,
+        )
+
+    SyncPostgrestClient.create_session = _sync_create_session  # type: ignore[method-assign]
+    AsyncPostgrestClient.create_session = _async_create_session  # type: ignore[method-assign]
+
+
+_patch_postgrest_httpx_http2()
 
 # Configuration Supabase depuis les variables d'environnement
 SUPABASE_URL = os.getenv(
@@ -34,6 +103,25 @@ SUPABASE_SERVICE_KEY = os.getenv(
 _INTERNAL_API_BEARER_RAW = os.getenv("INTERNAL_API_BEARER", "").strip()
 INTERNAL_API_BEARER = (
     _INTERNAL_API_BEARER_RAW if _INTERNAL_API_BEARER_RAW else "dev-internal-bearer"
+)
+
+
+def _default_jwt_secret_for_local_supabase(url: str) -> str:
+    """Secret JWT par défaut du CLI Supabase local (`supabase start`)."""
+    u = (url or "").lower()
+    if "127.0.0.1" in u or "localhost" in u:
+        return "super-secret-jwt-token-with-at-least-32-characters-long"
+    return ""
+
+
+# Secret pour vérifier les access tokens côté backend (HS256) sans GET /auth/v1/user.
+# Cloud : Dashboard → Project Settings → API → JWT Secret (legacy).
+# Local : souvent déjà couvert par défaut si SUPABASE_URL pointe sur localhost.
+_SUPABASE_JWT_SECRET_RAW = os.getenv("SUPABASE_JWT_SECRET", "").strip()
+SUPABASE_JWT_SECRET = (
+    _SUPABASE_JWT_SECRET_RAW
+    or os.getenv("JWT_SECRET", "").strip()
+    or _default_jwt_secret_for_local_supabase(SUPABASE_URL)
 )
 
 

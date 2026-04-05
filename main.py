@@ -8,6 +8,14 @@ from fastapi.responses import FileResponse
 from features.admin.admins_route import router as admin_router
 from features.customers.customers_route import router as player_router
 from features.auth.auth_route import router as auth_router
+from features.organization_article_orders.article_orders_route import (
+    router as organization_article_orders_router,
+)
+from features.organization_articles.organization_articles_route import (
+    router as organization_articles_router,
+)
+from features.members.members_route import router as members_router
+from features.organizations.organizations_route import router as organizations_router
 from features.users.users_route import router as users_router
 
 
@@ -20,6 +28,16 @@ app = FastAPI(
         {"name": "Users", "description": "Gestion des utilisateurs"},
         {"name": "Admins", "description": "Gestion des administrateurs"},
         {"name": "Customers", "description": "Gestion des clients"},
+        {"name": "Organizations", "description": "Organisations et membres"},
+        {"name": "Members", "description": "Espace membre d'organisation"},
+        {
+            "name": "Organization articles",
+            "description": "Articles, stock et images par organisation",
+        },
+        {
+            "name": "Organization article orders",
+            "description": "Commandes fournisseur / réception et impact sur le stock",
+        },
     ]
 )
 
@@ -48,3 +66,7 @@ app.include_router(auth_router)
 app.include_router(users_router)
 app.include_router(admin_router)
 app.include_router(player_router)
+app.include_router(organizations_router)
+app.include_router(members_router)
+app.include_router(organization_articles_router)
+app.include_router(organization_article_orders_router)
