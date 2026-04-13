@@ -12,3 +12,6 @@ python-dotenv
 
 # HTTP requests (pour renvoi d'email de confirmation)
 requests
+
+# Validation JWT Supabase sans appel réseau à GoTrue (évite erreurs SSL / reset)
+PyJWT~=2.10.0

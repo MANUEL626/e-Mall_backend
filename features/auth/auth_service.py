@@ -6,13 +6,16 @@ import logging
 import re
 from typing import Any, Dict, Optional
 
+import jwt
+import requests
 from supabase import Client
 
 from config.supabase_client import (
-    supabase_admin,
-    SUPABASE_URL,
-    SUPABASE_SERVICE_KEY,
     SUPABASE_ANON_KEY,
+    SUPABASE_JWT_SECRET,
+    SUPABASE_SERVICE_KEY,
+    SUPABASE_URL,
+    supabase_admin,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -43,28 +46,71 @@ class AuthService:
             raw = f"+{raw[2:]}"
         return raw
 
-    def _extract_auth_user_from_access_token(self, access_token: str) -> Dict[str, Any]:
-        import requests
+    @staticmethod
+    def _user_from_verified_jwt(token: str) -> Dict[str, Any]:
+        """Décode et vérifie le JWT (HS256) — pas d’appel réseau à GoTrue."""
+        try:
+            payload = jwt.decode(
+                token,
+                SUPABASE_JWT_SECRET,
+                algorithms=["HS256"],
+                options={"verify_aud": False},
+                leeway=30,
+            )
+        except jwt.ExpiredSignatureError:
+            raise ValueError("Token invalide ou expiré") from None
+        except jwt.InvalidTokenError:
+            raise ValueError("Token invalide ou expiré") from None
+        sub = payload.get("sub")
+        if not sub:
+            raise ValueError("Utilisateur introuvable dans le token")
+        return {
+            "id": str(sub),
+            "email": payload.get("email"),
+            "phone": payload.get("phone"),
+        }
 
+    def _user_from_gotrue_http(self, token: str) -> Dict[str, Any]:
+        """Secours si aucun JWT secret configuré (non recommandé en prod)."""
+        try:
+            response = requests.get(
+                f"{self.supabase_url}/auth/v1/user",
+                headers={
+                    "apikey": SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {token}",
+                },
+                timeout=15,
+            )
+        except requests.exceptions.RequestException as exc:
+            raise ValueError(
+                "Impossible de joindre Supabase Auth (réseau ou SSL). "
+                "Configurez SUPABASE_JWT_SECRET dans .env pour valider le JWT sans appel HTTP "
+                "(Supabase Dashboard → Project Settings → API → JWT Secret ; "
+                "en local CLI : super-secret-jwt-token-with-at-least-32-characters-long)."
+            ) from exc
+        if response.status_code != 200:
+            raise ValueError("Token invalide ou expiré")
+        body = response.json() or {}
+        if not body.get("id"):
+            raise ValueError("Utilisateur introuvable dans le token")
+        return body
+
+    def _extract_auth_user_from_access_token(self, access_token: str) -> Dict[str, Any]:
         token = (access_token or "").replace("Bearer ", "").strip()
         if not token:
             raise ValueError("Token utilisateur manquant")
+        if SUPABASE_JWT_SECRET:
+            return self._user_from_verified_jwt(token)
+        return self._user_from_gotrue_http(token)
 
-        response = requests.get(
-            f"{self.supabase_url}/auth/v1/user",
-            headers={
-                "apikey": SUPABASE_ANON_KEY,
-                "Authorization": f"Bearer {token}",
-            },
-            timeout=15,
-        )
-        if response.status_code != 200:
-            raise ValueError("Token invalide ou expiré")
+    def get_auth_user_from_access_token(self, access_token: str) -> Dict[str, Any]:
+        """Payload utilisateur GoTrue (`GET /auth/v1/user`) à partir du JWT Supabase."""
+        return self._extract_auth_user_from_access_token(access_token)
 
-        payload = response.json() or {}
-        if not payload.get("id"):
-            raise ValueError("Utilisateur introuvable dans le token")
-        return payload
+    def get_user_id_from_access_token(self, access_token: str) -> str:
+        """Identifiant `auth.users` / `public.users` à partir du JWT Supabase."""
+        payload = self.get_auth_user_from_access_token(access_token)
+        return str(payload["id"])
 
     def _safe_default_username(self, phone: Optional[str], user_id: str) -> str:
         if phone:
