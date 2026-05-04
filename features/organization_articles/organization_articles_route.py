@@ -14,6 +14,9 @@ from features.organization_articles.organization_articles_models import (
     OrganizationArticleResponse,
     OrganizationArticleUpdate,
 )
+from features.organization_article_posts.organization_article_posts_route import (
+    router as organization_article_posts_router,
+)
 from features.organization_articles.organization_articles_service import (
     OrganizationArticlesService,
 )
@@ -26,6 +29,13 @@ router = APIRouter(
 security = HTTPBearer()
 _service = OrganizationArticlesService()
 _auth = AuthService()
+
+# Sous-ressource : `/articles/{article_id}/posts` — enregistré avant `GET /{article_id}` pour éviter
+# tout conflit de matching avec le détail article.
+router.include_router(
+    organization_article_posts_router,
+    prefix="/{article_id}/posts",
+)
 
 
 def _current_user_id(credentials: HTTPAuthorizationCredentials) -> str:
