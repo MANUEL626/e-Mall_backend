@@ -18,6 +18,10 @@ class NotMemberError(Exception):
     """`user_type` différent de `member`."""
 
 
+class NotOrgMemberError(Exception):
+    """L’utilisateur n’est pas membre actif de l’organisation ciblée."""
+
+
 _AUTH_SAFE_KEYS = (
     "id",
     "email",
@@ -78,3 +82,28 @@ class MembersService:
             "memberships": memberships,
             "auth": auth_snap,
         }
+
+    def assert_active_member_of_org(self, user_id: str, organization_id: str) -> None:
+        mres = (
+            self.db.table("members")
+            .select("id")
+            .eq("user_id", user_id)
+            .eq("organization_id", organization_id)
+            .eq("activity_status", True)
+            .limit(1)
+            .execute()
+        )
+        if not (mres.data or []):
+            raise NotOrgMemberError()
+
+    def assert_user_is_member(self, user_id: str) -> None:
+        ures = (
+            self.db.table("users")
+            .select("user_type")
+            .eq("id", user_id)
+            .limit(1)
+            .execute()
+        )
+        rows = ures.data or []
+        if not rows or rows[0].get("user_type") != "member":
+            raise NotMemberError()
