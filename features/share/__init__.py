@@ -1,0 +1,2 @@
+"""Routes publiques de partage."""
+

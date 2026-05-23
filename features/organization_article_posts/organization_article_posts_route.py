@@ -5,7 +5,7 @@ Routes : posts promotionnels par article (JWT membre).
 from typing import List
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Path, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Path, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from features.auth.auth_service import AuthService
@@ -66,6 +66,7 @@ def upsert_article_post(
     organization_id: UUID,
     article_id: UUID,
     body: OrganizationArticlePostUpsert,
+    background_tasks: BackgroundTasks,
     slot: int = Path(..., ge=1, le=3, description="Emplacement 1, 2 ou 3"),
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
@@ -75,7 +76,14 @@ def upsert_article_post(
     """
     uid = _current_user_id(credentials)
     try:
-        row = _service.upsert_post(uid, str(organization_id), str(article_id), slot, body)
+        row = _service.upsert_post(
+            uid,
+            str(organization_id),
+            str(article_id),
+            slot,
+            body,
+            background_tasks,
+        )
         return OrganizationArticlePostResponse.model_validate(row)
     except PermissionError as exc:
         raise HTTPException(

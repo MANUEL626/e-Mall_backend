@@ -34,6 +34,26 @@ class OrganizationsService:
         return f"mem_{compact[:16]}"
 
     @staticmethod
+    def _normalize_countries(countries: Optional[List[str]]) -> List[str]:
+        out: List[str] = []
+        for item in countries or []:
+            code = str(item).strip().upper()
+            if not code:
+                continue
+            if len(code) != 2 or not code.isalpha():
+                raise ValueError("Les pays doivent utiliser le format ISO alpha-2, ex: TG, NG")
+            if code not in out:
+                out.append(code)
+        return out
+
+    @staticmethod
+    def _normalize_locale(locale: Optional[str]) -> str:
+        value = (locale or "fr").strip().lower()
+        if value not in {"fr", "en", "de", "zh"}:
+            raise ValueError("La langue doit etre fr, en, de ou zh")
+        return value
+
+    @staticmethod
     def _auth_error_message(exc: Exception) -> str:
         msg = str(exc).strip().lower()
         if "already" in msg or "registered" in msg or "exists" in msg:
@@ -47,6 +67,13 @@ class OrganizationsService:
         organization_description: Optional[str],
         email: str,
         password: str,
+        organization_profile_picture: Optional[str] = None,
+        organization_countries: Optional[List[str]] = None,
+        member_first_name: Optional[str] = None,
+        member_last_name: Optional[str] = None,
+        member_username: Optional[str] = None,
+        member_profile_picture: Optional[str] = None,
+        member_locale: Optional[str] = "fr",
     ) -> Dict[str, Any]:
         email_norm = email.strip().lower()
         name_clean = organization_name.strip()
@@ -55,6 +82,13 @@ class OrganizationsService:
             if organization_description and organization_description.strip()
             else None
         )
+        org_picture = (
+            organization_profile_picture.strip()
+            if organization_profile_picture and organization_profile_picture.strip()
+            else None
+        )
+        org_countries = self._normalize_countries(organization_countries)
+        locale = self._normalize_locale(member_locale)
 
         user_id: Optional[str] = None
 
@@ -73,15 +107,31 @@ class OrganizationsService:
             raise ValueError("Réponse Auth invalide après création utilisateur")
 
         user_id = str(auth_res.user.id)
-        username = self._generated_username(user_id)
+        username = (member_username or "").strip() or self._generated_username(user_id)
+        first_name = (
+            member_first_name.strip()
+            if member_first_name and member_first_name.strip()
+            else None
+        )
+        last_name = (
+            member_last_name.strip()
+            if member_last_name and member_last_name.strip()
+            else None
+        )
+        member_picture = (
+            member_profile_picture.strip()
+            if member_profile_picture and member_profile_picture.strip()
+            else None
+        )
 
         user_payload = {
             "id": user_id,
             "email": email_norm,
             "username": username,
             "user_type": "member",
-            "first_name": None,
-            "last_name": None,
+            "first_name": first_name,
+            "last_name": last_name,
+            "profile_picture": member_picture,
         }
 
         try:
@@ -104,6 +154,8 @@ class OrganizationsService:
             "name": name_clean,
             "org_type": organization_category,
             "description": desc_clean,
+            "profile_picture": org_picture,
+            "countries": org_countries,
             "created_by": user_id,
         }
 
@@ -127,12 +179,23 @@ class OrganizationsService:
                 raise ValueError("Conflit de données pour l'organisation") from exc
             raise ValueError("Impossible de créer l'organisation") from exc
 
+        try:
+            self.db.table("member_params").insert(
+                {"user_id": user_id, "locale": locale, "extra": {}}
+            ).execute()
+        except Exception:
+            pass
+
         return {
             "success": True,
             "message": "Compte membre et organisation créés. Vous pouvez vous connecter.",
             "user_id": user_id,
             "username": username,
             "organization_id": org_id,
+            "organization_profile_picture": org_picture,
+            "organization_countries": org_countries,
+            "member_profile_picture": member_picture,
+            "member_locale": locale,
         }
 
     def _ensure_org_and_inviter(
@@ -355,6 +418,13 @@ class OrganizationsService:
                     pass
             raise ValueError("Impossible d’ajouter le membre à l’organisation") from exc
 
+        try:
+            self.db.table("member_params").insert(
+                {"user_id": invited_user_id, "locale": "fr", "extra": {}}
+            ).execute()
+        except Exception:
+            pass
+
         if invite_sent:
             msg = (
                 "Une invitation a été envoyée à cette adresse. "
@@ -415,6 +485,67 @@ class OrganizationsService:
             u = users_by_id.get(uid, {})
             members_out.append({**r, "user": u})
         return {"members": members_out}
+
+    def update_organization_profile(
+        self,
+        organization_id: str,
+        actor_user_id: str,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        profile_picture: Optional[str] = None,
+        countries: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        self._ensure_org_and_inviter(organization_id, actor_user_id)
+        updates: Dict[str, Any] = {}
+
+        if name is not None:
+            clean_name = name.strip()
+            if not clean_name:
+                raise ValueError("name ne peut pas etre vide")
+            updates["name"] = clean_name
+
+        if description is not None:
+            updates["description"] = description.strip() or None
+
+        if profile_picture is not None:
+            updates["profile_picture"] = profile_picture.strip() or None
+
+        if countries is not None:
+            updates["countries"] = self._normalize_countries(countries)
+
+        if not updates:
+            raise ValueError(
+                "Au moins un parmi name, description, profile_picture, countries est requis"
+            )
+
+        try:
+            res = (
+                self.db.table("organizations")
+                .update(updates)
+                .eq("id", organization_id)
+                .execute()
+            )
+        except Exception as exc:
+            err_l = str(exc).lower()
+            if "duplicate" in err_l or "23505" in err_l or "unique" in err_l:
+                raise ValueError("Conflit de donnees pour l'organisation") from exc
+            raise ValueError("Impossible de mettre a jour l'organisation") from exc
+
+        rows = res.data or []
+        if rows:
+            return rows[0]
+
+        ref = (
+            self.db.table("organizations")
+            .select("*")
+            .eq("id", organization_id)
+            .limit(1)
+            .execute()
+        )
+        r2 = ref.data or []
+        if not r2:
+            raise OrganizationNotFound()
+        return r2[0]
 
     def update_organization_member(
         self,

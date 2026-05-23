@@ -10,6 +10,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+from features.organization_articles.organization_articles_models import ArticleCategory
+
 
 class CustomerSaleFulfillment(str, Enum):
     pickup = "pickup"
@@ -39,6 +41,8 @@ class CustomerParamsOut(BaseModel):
     locale: str
     default_longitude: Optional[float] = None
     default_latitude: Optional[float] = None
+    country: Optional[str] = None
+    interests: List[ArticleCategory] = Field(default_factory=list)
     extra: Optional[dict] = None
     updated_at: datetime
 
@@ -47,6 +51,8 @@ class CustomerParamsPatch(BaseModel):
     locale: Optional[str] = None
     default_longitude: Optional[float] = None
     default_latitude: Optional[float] = None
+    country: Optional[str] = None
+    interests: Optional[List[ArticleCategory]] = None
     extra: Optional[dict] = None
 
 
@@ -85,6 +91,25 @@ class AssignDeliveryBody(BaseModel):
         ...,
         description="id de la ligne `members` (livreur) pour cette organisation",
     )
+
+
+class DeliveryTrackPointIn(BaseModel):
+    latitude: float = Field(..., ge=-90, le=90)
+    longitude: float = Field(..., ge=-180, le=180)
+    accuracy_meters: Optional[float] = Field(
+        None,
+        ge=0,
+        description="Précision GPS estimée en mètres (optionnel).",
+    )
+
+
+class DeliveryTrackPointOut(BaseModel):
+    id: UUID
+    order_id: UUID
+    latitude: float
+    longitude: float
+    accuracy_meters: Optional[float] = None
+    recorded_at: datetime
 
 
 class QrPayloadOut(BaseModel):

@@ -17,6 +17,7 @@ from config.supabase_client import (
     SUPABASE_URL,
     supabase_admin,
 )
+from features.customers.customer_i18n import CustomerI18nService, translate_message
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ class AuthService:
         self.supabase: Client = supabase_admin
         self.supabase_url = SUPABASE_URL
         self.service_role_key = SUPABASE_SERVICE_KEY
+        self._i18n = CustomerI18nService()
 
         if not self.supabase_url or not self.service_role_key:
             raise ValueError(
@@ -120,6 +122,41 @@ class AuthService:
             suffix = user_id.replace("-", "")[:8]
         return f"cust_{suffix}"
 
+    def _ensure_customer_params(self, user_id: str) -> None:
+        """
+        CrÃ©e les paramÃ¨tres customer dÃ¨s le bootstrap.
+        `country` et `interests` restent dans extra pour garder la table extensible.
+        """
+        cres = (
+            self.supabase.table("customers")
+            .select("id")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        crows = cres.data or []
+        if not crows:
+            raise ValueError("Profil customer introuvable aprÃ¨s bootstrap")
+        customer_id = str(crows[0]["id"])
+
+        existing = (
+            self.supabase.table("customer_params")
+            .select("customer_id")
+            .eq("customer_id", customer_id)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            return
+
+        self.supabase.table("customer_params").insert(
+            {
+                "customer_id": customer_id,
+                "locale": "fr",
+                "extra": {"country": None, "interests": []},
+            }
+        ).execute()
+
     def bootstrap_customer_from_token(
         self,
         access_token: str,
@@ -158,6 +195,7 @@ class AuthService:
 
         is_new_customer = bool(row.get("is_new_customer"))
         profile_complete = bool(row.get("profile_complete"))
+        self._ensure_customer_params(user_id)
 
         ures = (
             self.supabase.table("users")
@@ -171,13 +209,15 @@ class AuthService:
             raise ValueError("Profil utilisateur introuvable après bootstrap")
 
         u = urows[0]
+        locale = self._i18n.locale_for_user_id(user_id)
+        message = (
+            "Compte customer créé, finalisez votre profil."
+            if is_new_customer
+            else "Connexion customer réussie."
+        )
         return {
             "success": True,
-            "message": (
-                "Compte customer créé, finalisez votre profil."
-                if is_new_customer
-                else "Connexion customer réussie."
-            ),
+            "message": translate_message(message, locale),
             "user_id": user_id,
             "is_new_customer": is_new_customer,
             "profile_complete": profile_complete,
@@ -288,9 +328,10 @@ class AuthService:
         profile_complete = self._compute_profile_complete(u)
 
         # Même contrat JSON que le bootstrap ; après PATCH, is_new_customer est toujours false.
+        locale = self._i18n.locale_for_user_id(user_id)
         return {
             "success": True,
-            "message": "Connexion customer réussie.",
+            "message": translate_message("Connexion customer réussie.", locale),
             "user_id": user_id,
             "is_new_customer": False,
             "profile_complete": profile_complete,
