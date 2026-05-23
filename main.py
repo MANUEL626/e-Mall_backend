@@ -1,13 +1,29 @@
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 # Import des routeurs pour les utilisateurs
 from features.admin.admins_route import router as admin_router
 from features.customers.customers_route import router as player_router
 from features.auth.auth_route import router as auth_router
+from features.messaging.messaging_route import router as messaging_router
+from features.messaging.messaging_service import MessagingNotConfiguredError
+from features.customer_sales.customer_sales_route import (
+    customer_router as customer_sales_customer_router,
+    delivery_router as customer_sales_delivery_router,
+    org_router as customer_sales_org_router,
+)
+from features.organization_article_orders.article_orders_route import (
+    router as organization_article_orders_router,
+)
+from features.organization_articles.organization_articles_route import (
+    router as organization_articles_router,
+)
+from features.share.share_route import router as share_router
+from features.members.members_route import router as members_router
+from features.organizations.organizations_route import router as organizations_router
 from features.users.users_route import router as users_router
 
 
@@ -19,7 +35,39 @@ app = FastAPI(
         {"name": "Auth", "description": "Authentification et inscription"},
         {"name": "Users", "description": "Gestion des utilisateurs"},
         {"name": "Admins", "description": "Gestion des administrateurs"},
-        {"name": "Customers", "description": "Gestion des clients"},
+        {
+            "name": "Customers",
+            "description": "Gestion des clients (catalogue, favoris, paniers, abonnements marchands)",
+        },
+        {"name": "Organizations", "description": "Organisations et membres"},
+        {
+            "name": "Members",
+            "description": "Espace membre d'organisation (profil, abonnés de la boutique)",
+        },
+        {
+            "name": "Organization articles",
+            "description": "Articles, stock et images par organisation",
+        },
+        {
+            "name": "Organization article posts",
+            "description": "Posts promotionnels (image/vidéo) par article, emplacements 1 à 3",
+        },
+        {
+            "name": "Organization article orders",
+            "description": "Commandes fournisseur / réception et impact sur le stock",
+        },
+        {
+            "name": "Messaging",
+            "description": "Conversations directes et messages temps réel (Supabase RLS)",
+        },
+        {
+            "name": "Customer sales",
+            "description": "Commandes client, retrait, livraison, vente hors système",
+        },
+        {
+            "name": "Customer params",
+            "description": "Langue et coordonnées par défaut du client",
+        },
     ]
 )
 
@@ -42,9 +90,28 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(MessagingNotConfiguredError)
+async def messaging_schema_missing_handler(
+    _request: Request, exc: MessagingNotConfiguredError
+) -> JSONResponse:
+    """Migration messagerie absente sur le projet Supabase lié (PGRST205)."""
+    return JSONResponse(
+        status_code=503,
+        content={"detail": str(exc)},
+    )
+
 
 # Inclusion des routes
+app.include_router(share_router)
 app.include_router(auth_router)
 app.include_router(users_router)
 app.include_router(admin_router)
 app.include_router(player_router)
+app.include_router(organizations_router)
+app.include_router(members_router)
+app.include_router(organization_articles_router)
+app.include_router(organization_article_orders_router)
+app.include_router(messaging_router)
+app.include_router(customer_sales_customer_router)
+app.include_router(customer_sales_org_router)
+app.include_router(customer_sales_delivery_router)

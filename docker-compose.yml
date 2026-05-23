@@ -1,0 +1,13 @@
+# Lance uniquement l’API. Supabase : projet cloud ou `supabase start` sur la machine.
+# Si Supabase tourne sur l’hôte (port 54321), dans `.env` utilisez par exemple :
+#   SUPABASE_URL=http://host.docker.internal:54321
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    # Linux : aide à résoudre l’hôte depuis le conteneur
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
