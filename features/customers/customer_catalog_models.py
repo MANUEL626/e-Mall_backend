@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from features.organization_article_posts.organization_article_posts_models import (
     ArticlePostMediaKind,
+    ArticlePostProcessingStatus,
 )
 from features.organization_articles.organization_articles_models import (
     ArticleCategory,
@@ -47,7 +48,13 @@ class CustomerArticlePostPublic(BaseModel):
     slot: int = Field(..., ge=1, le=3)
     media_kind: ArticlePostMediaKind
     media_storage_path: str
+    video_mobile_low_storage_path: Optional[str] = None
+    thumbnail_storage_path: Optional[str] = None
     caption: Optional[str] = None
+    processing_status: ArticlePostProcessingStatus = ArticlePostProcessingStatus.ready
+    media_width: Optional[int] = None
+    media_height: Optional[int] = None
+    media_duration_seconds: Optional[float] = None
     created_at: datetime
     updated_at: datetime
 
@@ -72,7 +79,13 @@ class CustomerArticlePostFeedItem(BaseModel):
     slot: int = Field(..., ge=1, le=3)
     media_kind: ArticlePostMediaKind
     media_storage_path: str
+    video_mobile_low_storage_path: Optional[str] = None
+    thumbnail_storage_path: Optional[str] = None
     caption: Optional[str] = None
+    processing_status: ArticlePostProcessingStatus = ArticlePostProcessingStatus.ready
+    media_width: Optional[int] = None
+    media_height: Optional[int] = None
+    media_duration_seconds: Optional[float] = None
 
     model_config = {"from_attributes": True}
 

@@ -11,11 +11,25 @@ from features.auth.auth_models import (
     CustomerProfileUpdateRequest,
 )
 from features.auth.auth_service import AuthService
+from features.customers.customer_i18n import CustomerI18nService, translate_message
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Auth"])
 
 auth_service = AuthService()
+_i18n = CustomerI18nService()
 security = HTTPBearer()
+
+
+def _locale_from_token(access_token: str) -> str:
+    try:
+        user_id = auth_service.get_user_id_from_access_token(access_token)
+        return _i18n.locale_for_user_id(user_id)
+    except Exception:
+        return "fr"
+
+
+def _localized_detail(message: str, access_token: str) -> str:
+    return translate_message(message, _locale_from_token(access_token))
 
 
 @router.post("/customer/bootstrap", response_model=CustomerBootstrapResponse)
@@ -36,7 +50,10 @@ async def bootstrap_customer_after_phone_login(
         )
         return CustomerBootstrapResponse(**result)
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_localized_detail(str(exc), credentials.credentials),
+        )
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -66,9 +83,15 @@ async def update_customer_profile(
         )
         return CustomerBootstrapResponse(**result)
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_localized_detail(str(exc), credentials.credentials),
+        )
     except PermissionError as exc:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=_localized_detail(str(exc), credentials.credentials),
+        )
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

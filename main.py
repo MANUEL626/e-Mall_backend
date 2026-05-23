@@ -21,6 +21,7 @@ from features.organization_article_orders.article_orders_route import (
 from features.organization_articles.organization_articles_route import (
     router as organization_articles_router,
 )
+from features.share.share_route import router as share_router
 from features.members.members_route import router as members_router
 from features.organizations.organizations_route import router as organizations_router
 from features.users.users_route import router as users_router
@@ -101,6 +102,7 @@ async def messaging_schema_missing_handler(
 
 
 # Inclusion des routes
+app.include_router(share_router)
 app.include_router(auth_router)
 app.include_router(users_router)
 app.include_router(admin_router)

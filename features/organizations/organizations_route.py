@@ -16,6 +16,7 @@ from features.organizations.organizations_models import (
     OrganizationMembersListResponse,
     RegisterMemberOrganizationRequest,
     RegisterMemberOrganizationResponse,
+    UpdateOrganizationProfileRequest,
     UpdateOrganizationMemberRequest,
 )
 from features.organizations.organizations_service import (
@@ -48,8 +49,15 @@ async def register_member_and_organization(body: RegisterMemberOrganizationReque
             organization_name=body.organization_name,
             organization_category=body.organization_category.value,
             organization_description=body.organization_description,
+            organization_profile_picture=body.organization_profile_picture,
+            organization_countries=body.organization_countries,
             email=str(body.email),
             password=body.password,
+            member_first_name=body.member_first_name,
+            member_last_name=body.member_last_name,
+            member_username=body.member_username,
+            member_profile_picture=body.member_profile_picture,
+            member_locale=body.member_locale,
         )
         return RegisterMemberOrganizationResponse(**result)
     except ValueError as exc:
@@ -61,6 +69,57 @@ async def register_member_and_organization(body: RegisterMemberOrganizationReque
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Inscription impossible : {str(exc)}",
+        ) from exc
+
+
+@router.patch("/{organization_id}")
+def update_organization_profile(
+    organization_id: UUID,
+    body: UpdateOrganizationProfileRequest,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    """
+    Met a jour la fiche organisation : nom, description, image de profil, pays.
+
+    Auth : `Authorization: Bearer <access_token Supabase>`.
+    L'appelant doit etre admin ou supervisor actif de l'organisation.
+    """
+    try:
+        actor_id = _auth.get_user_id_from_access_token(credentials.credentials)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+        ) from exc
+
+    try:
+        return _service.update_organization_profile(
+            organization_id=str(organization_id),
+            actor_user_id=actor_id,
+            name=body.name,
+            description=body.description,
+            profile_picture=body.profile_picture,
+            countries=body.countries,
+        )
+    except OrganizationNotFound as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Organisation introuvable",
+        ) from exc
+    except OrganizationInviteForbidden as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Acces refuse pour cette organisation",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
         ) from exc
 
 

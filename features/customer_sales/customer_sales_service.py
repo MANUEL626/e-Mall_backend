@@ -9,6 +9,7 @@ import hashlib
 import os
 import secrets
 from decimal import Decimal, ROUND_HALF_UP
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
 
 from supabase import Client
@@ -20,10 +21,12 @@ from features.customer_sales.customer_sales_models import (
     CustomerSaleFulfillment,
     CustomerSaleOrderCreate,
     CustomerSaleOrderStatus,
+    DeliveryTrackPointIn,
     PatchOrderStatusBody,
     StatusGroup,
     WalkInSaleCreate,
 )
+from features.organization_articles.organization_articles_models import ArticleCategory
 
 
 def _qr_pepper() -> str:
@@ -118,6 +121,42 @@ class CustomerSalesService:
 
     # --- customer_params ---
 
+    @staticmethod
+    def _default_customer_extra() -> Dict[str, Any]:
+        return {"country": None, "interests": []}
+
+    @staticmethod
+    def _clean_customer_extra(extra: Optional[dict]) -> Dict[str, Any]:
+        cleaned = CustomerSalesService._default_customer_extra()
+        if isinstance(extra, dict):
+            cleaned.update(extra)
+
+        country = cleaned.get("country")
+        if isinstance(country, str) and country.strip():
+            cleaned["country"] = country.strip()
+        else:
+            cleaned["country"] = None
+
+        allowed = {category.value for category in ArticleCategory}
+        raw_interests = cleaned.get("interests")
+        if not isinstance(raw_interests, list):
+            raw_interests = []
+        cleaned["interests"] = [
+            str(item).strip()
+            for item in raw_interests
+            if str(item).strip() in allowed
+        ]
+        return cleaned
+
+    @classmethod
+    def _customer_params_out(cls, row: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(row)
+        extra = cls._clean_customer_extra(out.get("extra"))
+        out["extra"] = extra
+        out["country"] = extra.get("country")
+        out["interests"] = extra.get("interests") or []
+        return out
+
     def get_customer_params(self, customer_id: str) -> Optional[Dict[str, Any]]:
         res = (
             self.db.table("customer_params")
@@ -127,13 +166,17 @@ class CustomerSalesService:
             .execute()
         )
         rows = res.data or []
-        return rows[0] if rows else None
+        return self._customer_params_out(rows[0]) if rows else None
 
     def get_or_create_customer_params(self, customer_id: str) -> Dict[str, Any]:
         existing = self.get_customer_params(customer_id)
         if existing:
             return existing
-        return self.upsert_customer_params(customer_id, locale="fr")
+        return self.upsert_customer_params(
+            customer_id,
+            locale="fr",
+            extra=self._default_customer_extra(),
+        )
 
     def upsert_customer_params(
         self,
@@ -141,6 +184,8 @@ class CustomerSalesService:
         locale: Optional[str] = None,
         default_longitude: Optional[float] = None,
         default_latitude: Optional[float] = None,
+        country: Optional[str] = None,
+        interests: Optional[List[ArticleCategory]] = None,
         extra: Optional[dict] = None,
     ) -> Dict[str, Any]:
         existing = self.get_customer_params(customer_id)
@@ -151,8 +196,21 @@ class CustomerSalesService:
             payload["default_longitude"] = default_longitude
         if default_latitude is not None:
             payload["default_latitude"] = default_latitude
+        merged_extra = self._clean_customer_extra(
+            existing.get("extra") if existing else None
+        )
         if extra is not None:
-            payload["extra"] = extra
+            merged_extra.update(extra)
+            merged_extra = self._clean_customer_extra(merged_extra)
+        if country is not None:
+            country_clean = country.strip()
+            merged_extra["country"] = country_clean if country_clean else None
+        if interests is not None:
+            merged_extra["interests"] = [
+                item.value if hasattr(item, "value") else str(item)
+                for item in interests
+            ]
+        payload["extra"] = self._clean_customer_extra(merged_extra)
 
         if existing:
             upd = {k: v for k, v in payload.items() if k != "customer_id"}
@@ -169,7 +227,7 @@ class CustomerSalesService:
         rows = res.data or []
         if not rows:
             raise RuntimeError("Mise à jour customer_params refusée")
-        return rows[0]
+        return self._customer_params_out(rows[0])
 
     # --- vente client ---
 
@@ -195,6 +253,33 @@ class CustomerSalesService:
                 raise ValueError(f"Article inactif : {aid}")
         return by_id
 
+    def _org_has_active_delivery_member(self, organization_id: str) -> bool:
+        """
+        Au moins un livreur utilisable : membre actif dans l'org (members.activity_status)
+        ET compte utilisateur actif (users.activity_status).
+        """
+        mres = (
+            self.db.table("members")
+            .select("user_id")
+            .eq("organization_id", organization_id)
+            .eq("member_role", "delivery_management")
+            .eq("activity_status", True)
+            .execute()
+        )
+        rows = mres.data or []
+        if not rows:
+            return False
+        uids = [str(r["user_id"]) for r in rows]
+        ures = (
+            self.db.table("users")
+            .select("id")
+            .in_("id", uids)
+            .eq("activity_status", True)
+            .limit(1)
+            .execute()
+        )
+        return bool(ures.data)
+
     def create_customer_sale_order(
         self, user_id: str, body: CustomerSaleOrderCreate
     ) -> Dict[str, Any]:
@@ -218,6 +303,12 @@ class CustomerSalesService:
                 raise ValueError(
                     "Livraison : renseigner delivery_longitude et delivery_latitude "
                     "(ou les enregistrer dans les paramètres client)."
+                )
+            if not self._org_has_active_delivery_member(oid):
+                raise ValueError(
+                    "Aucun livreur actif n'est disponible pour cette organisation "
+                    "(compte désactivé côté boutique ou utilisateur). "
+                    "Passez votre commande en retrait sur place (pickup)."
                 )
 
         article_ids = [str(l.article_id) for l in body.lines]
@@ -779,3 +870,127 @@ class CustomerSalesService:
         )
         rows = res.data or []
         return [self._select_order_with_lines(str(r["id"])) for r in rows]
+
+    def _assert_user_activity(self, user_id: str) -> None:
+        ures = (
+            self.db.table("users")
+            .select("activity_status")
+            .eq("id", user_id)
+            .limit(1)
+            .execute()
+        )
+        urows = ures.data or []
+        if not urows or not urows[0].get("activity_status"):
+            raise PermissionError("Compte utilisateur inactif")
+
+    def _query_delivery_track_points(
+        self,
+        order_id: str,
+        *,
+        since: Optional[datetime] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        cap = max(1, min(limit, 500))
+        q = (
+            self.db.table("customer_sale_delivery_track_points")
+            .select("id,order_id,latitude,longitude,accuracy_meters,recorded_at")
+            .eq("order_id", order_id)
+            .order("recorded_at", desc=False)
+        )
+        if since is not None:
+            q = q.gte("recorded_at", since.isoformat())
+        res = q.limit(cap).execute()
+        return list(res.data or [])
+
+    def post_delivery_track_point(
+        self, user_id: str, order_id: str, body: DeliveryTrackPointIn
+    ) -> Dict[str, Any]:
+        self._assert_user_activity(user_id)
+        ores = (
+            self.db.table("organization_customer_sale_orders")
+            .select(
+                "organization_id,fulfillment_type,status,assigned_delivery_member_id"
+            )
+            .eq("id", order_id)
+            .limit(1)
+            .execute()
+        )
+        orows = ores.data or []
+        if not orows:
+            raise LookupError("Commande introuvable")
+        o = orows[0]
+        if o["fulfillment_type"] != CustomerSaleFulfillment.delivery.value:
+            raise ValueError("Cette commande n'est pas une livraison")
+        st = o["status"]
+        if st in (
+            CustomerSaleOrderStatus.cancelled.value,
+            CustomerSaleOrderStatus.completed.value,
+        ):
+            raise ValueError("Commande terminée : envoi de position impossible")
+        org_id = str(o["organization_id"])
+        m = self._get_member(user_id, org_id)
+        if m.get("member_role") != "delivery_management":
+            raise PermissionError("Rôle livreur requis")
+        assigned = o.get("assigned_delivery_member_id")
+        if not assigned or str(assigned) != str(m["id"]):
+            raise PermissionError("Vous n'êtes pas le livreur assigné à cette commande")
+
+        payload: Dict[str, Any] = {
+            "order_id": order_id,
+            "latitude": float(body.latitude),
+            "longitude": float(body.longitude),
+        }
+        if body.accuracy_meters is not None:
+            payload["accuracy_meters"] = float(body.accuracy_meters)
+        try:
+            ins = (
+                self.db.table("customer_sale_delivery_track_points")
+                .insert(payload)
+                .execute()
+            )
+        except APIError as exc:
+            msg = (
+                str(exc.message)
+                if getattr(exc, "message", None)
+                else "Enregistrement du point de suivi refusé"
+            )
+            raise ValueError(msg) from exc
+        rows = ins.data or []
+        if not rows:
+            raise RuntimeError("Enregistrement du point de suivi refusé")
+        return rows[0]
+
+    def list_delivery_track_points_customer(
+        self,
+        user_id: str,
+        order_id: str,
+        *,
+        since: Optional[datetime] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        row = self._select_order_with_lines(order_id)
+        cid = self.get_customer_id_for_user(user_id)
+        if not cid or str(row.get("customer_id")) != cid:
+            raise LookupError("Commande introuvable")
+        if row["fulfillment_type"] != CustomerSaleFulfillment.delivery.value:
+            return []
+        return self._query_delivery_track_points(
+            order_id, since=since, limit=limit
+        )
+
+    def list_delivery_track_points_org(
+        self,
+        user_id: str,
+        organization_id: str,
+        order_id: str,
+        *,
+        since: Optional[datetime] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        self.get_org_order(user_id, organization_id, order_id)
+        row = self._select_order_with_lines(order_id)
+        if row["fulfillment_type"] != CustomerSaleFulfillment.delivery.value:
+            return []
+        return self._query_delivery_track_points(
+            order_id, since=since, limit=limit
+        )

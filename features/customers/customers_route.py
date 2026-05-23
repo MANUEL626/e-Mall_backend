@@ -16,6 +16,7 @@ from features.customers.customer_catalog_models import (
     CustomerCatalogProduct,
 )
 from features.customers.customer_catalog_service import CustomerCatalogService
+from features.customers.customer_i18n import CustomerI18nService
 from features.customers.customer_wishlist_cart_models import (
     AddCartItemBody,
     AddWishlistItemBody,
@@ -45,6 +46,7 @@ _catalog = CustomerCatalogService()
 _wish_cart = CustomerWishlistCartService()
 _subscriptions = CustomerSubscriptionsService()
 _customer_sales = CustomerSalesService()
+_i18n = CustomerI18nService()
 
 router = APIRouter(prefix="/api/v1/customers", tags=["Customers"])
 
@@ -75,9 +77,17 @@ def require_customer_id(user_id: str = Depends(require_authenticated_user)) -> s
     if not cid:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Profil client introuvable",
+            detail=_i18n.translate_for_user(user_id, "Profil client introuvable"),
         )
     return cid
+
+
+def _customer_detail(customer_id: str, message: str) -> str:
+    return _i18n.translate_for_customer(customer_id, message)
+
+
+def _user_detail(user_id: str, message: str) -> str:
+    return _i18n.translate_for_user(user_id, message)
 
 
 class UpdateCustomerRequest(BaseModel):
@@ -104,7 +114,11 @@ def get_my_player_profile(credentials: HTTPAuthorizationCredentials = Depends(se
     res = client.table("customers").select("*").limit(1).execute()
     data = res.data or []
     if not data:
-        raise HTTPException(status_code=404, detail="Profil player introuvable")
+        user_id = _require_user_id(credentials)
+        raise HTTPException(
+            status_code=404,
+            detail=_user_detail(user_id, "Profil player introuvable"),
+        )
     return data[0]
 
 
@@ -128,6 +142,8 @@ def patch_my_customer_params(
         locale=body.locale,
         default_longitude=body.default_longitude,
         default_latitude=body.default_latitude,
+        country=body.country,
+        interests=body.interests,
         extra=body.extra,
     )
     return CustomerParamsOut.model_validate(row)
@@ -146,7 +162,11 @@ def update_my_player_profile(
     res = client.table("customers").update({"username": body.username}).execute()
     data = res.data or []
     if not data:
-        raise HTTPException(status_code=403, detail="Action non autorisée")
+        user_id = _require_user_id(credentials)
+        raise HTTPException(
+            status_code=403,
+            detail=_user_detail(user_id, "Action non autorisée"),
+        )
     return data[0]
 
 
@@ -164,7 +184,7 @@ def _catalog_limit_offset(
 
 @router.get("/posts/feed", response_model=CustomerArticlePostFeedPage)
 def list_customer_article_post_feed(
-    _: str = Depends(require_authenticated_user),
+    customer_id: str = Depends(require_customer_id),
     pagination: tuple[int, int] = Depends(_catalog_limit_offset),
 ):
     """
@@ -173,7 +193,11 @@ def list_customer_article_post_feed(
     Requiert la migration `customer_article_post_feed` sur Supabase.
     """
     limit, offset = pagination
-    rows, total = _catalog.list_article_post_feed_page(limit=limit, offset=offset)
+    rows, total = _catalog.list_article_post_feed_page(
+        limit=limit,
+        offset=offset,
+        customer_id=customer_id,
+    )
     return CustomerArticlePostFeedPage(
         items=[CustomerArticlePostFeedItem.model_validate(r) for r in rows],
         total=total,
@@ -184,7 +208,7 @@ def list_customer_article_post_feed(
 
 @router.get("/products", response_model=CustomerCatalogPage)
 def list_customer_catalog_products(
-    _: str = Depends(require_authenticated_user),
+    customer_id: str = Depends(require_customer_id),
     pagination: tuple[int, int] = Depends(_catalog_limit_offset),
 ):
     """
@@ -192,7 +216,11 @@ def list_customer_catalog_products(
     JWT Supabase requis.
     """
     limit, offset = pagination
-    rows, total = _catalog.list_catalog_page(limit=limit, offset=offset)
+    rows, total = _catalog.list_catalog_page(
+        limit=limit,
+        offset=offset,
+        customer_id=customer_id,
+    )
     return CustomerCatalogPage(
         items=[CustomerCatalogProduct.model_validate(r) for r in rows],
         total=total,
@@ -204,7 +232,7 @@ def list_customer_catalog_products(
 @router.get("/products/search", response_model=CustomerCatalogPage)
 def search_customer_catalog_products(
     q: str = Query(..., min_length=1, description="Sous-chaîne recherchée dans le nom (insensible à la casse)."),
-    _: str = Depends(require_authenticated_user),
+    customer_id: str = Depends(require_customer_id),
     pagination: tuple[int, int] = Depends(_catalog_limit_offset),
 ):
     """Recherche d’articles par nom (parmi les articles actifs)."""
@@ -212,6 +240,7 @@ def search_customer_catalog_products(
     rows, total = _catalog.list_catalog_page(
         limit=limit,
         offset=offset,
+        customer_id=customer_id,
         name_ilike=q,
     )
     return CustomerCatalogPage(
@@ -228,7 +257,7 @@ def search_customer_catalog_products(
 )
 def list_customer_article_posts(
     organization_article_id: UUID,
-    _: str = Depends(require_authenticated_user),
+    customer_id: str = Depends(require_customer_id),
 ):
     """Posts promotionnels actifs d’un article actif (bucket `organization-article-posts`)."""
     try:
@@ -237,7 +266,7 @@ def list_customer_article_posts(
     except LookupError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(exc),
+            detail=_customer_detail(customer_id, str(exc)),
         ) from exc
 
 
@@ -253,7 +282,7 @@ def filter_customer_catalog_products(
     ),
     min_price: Optional[Decimal] = Query(None, ge=0, description="Prix unitaire minimum."),
     max_price: Optional[Decimal] = Query(None, ge=0, description="Prix unitaire maximum."),
-    _: str = Depends(require_authenticated_user),
+    customer_id: str = Depends(require_customer_id),
     pagination: tuple[int, int] = Depends(_catalog_limit_offset),
 ):
     """
@@ -267,17 +296,24 @@ def filter_customer_catalog_products(
     if not (has_name or has_cat or has_min or has_max):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Fournir au moins un filtre : name, category, min_price ou max_price.",
+            detail=_customer_detail(
+                customer_id,
+                "Fournir au moins un filtre : name, category, min_price ou max_price.",
+            ),
         )
     if has_min and has_max and min_price > max_price:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="min_price doit être inférieur ou égal à max_price.",
+            detail=_customer_detail(
+                customer_id,
+                "min_price doit être inférieur ou égal à max_price.",
+            ),
         )
     limit, offset = pagination
     rows, total = _catalog.list_catalog_page(
         limit=limit,
         offset=offset,
+        customer_id=customer_id,
         name_ilike=name.strip() if has_name else None,
         categories=cats,
         min_price=min_price,
@@ -310,7 +346,7 @@ def add_customer_wishlist_item(
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc),
+            detail=_customer_detail(customer_id, str(exc)),
         ) from exc
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -364,12 +400,12 @@ def add_customer_cart_item(
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc),
+            detail=_customer_detail(customer_id, str(exc)),
         ) from exc
     except RuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(exc),
+            detail=_customer_detail(customer_id, str(exc)),
         ) from exc
     return CustomerCartItemAddResponse(
         cart_id=UUID(cart_id),
@@ -388,7 +424,7 @@ def patch_customer_cart_line(
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(exc),
+            detail=_customer_detail(customer_id, str(exc)),
         ) from exc
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -402,7 +438,7 @@ def delete_customer_cart_line(
     if not ok:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Ligne introuvable",
+            detail=_customer_detail(customer_id, "Ligne introuvable"),
         )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -416,7 +452,7 @@ def delete_customer_cart(
     if not ok:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Panier introuvable",
+            detail=_customer_detail(customer_id, "Panier introuvable"),
         )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -427,7 +463,7 @@ def delete_customer_cart(
 )
 def get_customer_organization_summary(
     organization_id: UUID,
-    _: str = Depends(require_customer_id),
+    customer_id: str = Depends(require_customer_id),
 ):
     """
     Informations minimales sur une organisation : nom et nombre d’abonnés actifs.
@@ -436,7 +472,7 @@ def get_customer_organization_summary(
     if not row:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Organisation introuvable",
+            detail=_customer_detail(customer_id, "Organisation introuvable"),
         )
     return CustomerOrganizationSummary.model_validate(row)
 
@@ -461,12 +497,12 @@ def subscribe_customer_to_organization(
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(exc),
+            detail=_customer_detail(customer_id, str(exc)),
         ) from exc
     except RuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(exc),
+            detail=_customer_detail(customer_id, str(exc)),
         ) from exc
     return CustomerSubscribeResponse.model_validate(row)
 
@@ -484,6 +520,6 @@ def unsubscribe_customer_from_organization(
     if not ok:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Abonnement actif introuvable",
+            detail=_customer_detail(customer_id, "Abonnement actif introuvable"),
         )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
