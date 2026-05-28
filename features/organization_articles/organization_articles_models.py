@@ -32,6 +32,18 @@ class ArticleStockStatus(str, Enum):
     out_of_stock = "out_of_stock"
 
 
+class CurrencyCode(str, Enum):
+    """Codes devises supportes par l'application (ISO 4217 en minuscules)."""
+
+    xof = "xof"
+    eur = "eur"
+    usd = "usd"
+    gbp = "gbp"
+    cny = "cny"
+    ngn = "ngn"
+    ghs = "ghs"
+
+
 class WholesalePriceTier(BaseModel):
     """
     Palier de prix de vente en gros.
@@ -81,6 +93,7 @@ class OrganizationArticleCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=500)
     category: ArticleCategory
     unit_sale_price: Decimal = Field(..., ge=0)
+    sale_currency: Optional[CurrencyCode] = None
     wholesale_prices: Optional[List[WholesalePriceTier]] = None
     stock_quantity: int = Field(0, ge=0)
     alert_quantity: int = Field(0, ge=0)
@@ -100,6 +113,7 @@ class OrganizationArticleUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=500)
     category: Optional[ArticleCategory] = None
     unit_sale_price: Optional[Decimal] = Field(None, ge=0)
+    sale_currency: Optional[CurrencyCode] = None
     wholesale_prices: Optional[List[WholesalePriceTier]] = None
     stock_quantity: Optional[int] = Field(None, ge=0)
     alert_quantity: Optional[int] = Field(None, ge=0)
@@ -121,6 +135,7 @@ class OrganizationArticleResponse(BaseModel):
     name: str
     category: ArticleCategory
     unit_sale_price: Decimal
+    sale_currency: CurrencyCode
     wholesale_prices: Optional[Any] = None
     stock_quantity: int
     alert_quantity: int

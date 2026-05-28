@@ -41,7 +41,7 @@ def list_article_posts(
     article_id: UUID,
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
-    """Liste les posts (emplacements 1–3) pour un article."""
+    """Liste les posts pour un article."""
     uid = _current_user_id(credentials)
     try:
         rows = _service.list_posts(uid, str(organization_id), str(article_id))
@@ -67,7 +67,7 @@ def upsert_article_post(
     article_id: UUID,
     body: OrganizationArticlePostUpsert,
     background_tasks: BackgroundTasks,
-    slot: int = Path(..., ge=1, le=3, description="Emplacement 1, 2 ou 3"),
+    slot: int = Path(..., ge=1, description="Emplacement du post, entier >= 1"),
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
     """
@@ -111,7 +111,7 @@ def upsert_article_post(
 def delete_article_post(
     organization_id: UUID,
     article_id: UUID,
-    slot: int = Path(..., ge=1, le=3),
+    slot: int = Path(..., ge=1),
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
     uid = _current_user_id(credentials)
