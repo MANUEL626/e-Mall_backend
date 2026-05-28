@@ -24,6 +24,10 @@ from features.organization_articles.organization_articles_route import (
 from features.share.share_route import router as share_router
 from features.members.members_route import router as members_router
 from features.organizations.organizations_route import router as organizations_router
+from features.organization_subscriptions.organization_subscriptions_route import (
+    router as organization_subscriptions_router,
+)
+from features.performance.performance_route import router as performance_router
 from features.users.users_route import router as users_router
 
 
@@ -41,6 +45,10 @@ app = FastAPI(
         },
         {"name": "Organizations", "description": "Organisations et membres"},
         {
+            "name": "Organization subscriptions",
+            "description": "Plans, abonnements et droits des organisations",
+        },
+        {
             "name": "Members",
             "description": "Espace membre d'organisation (profil, abonnés de la boutique)",
         },
@@ -50,7 +58,7 @@ app = FastAPI(
         },
         {
             "name": "Organization article posts",
-            "description": "Posts promotionnels (image/vidéo) par article, emplacements 1 à 3",
+            "description": "Posts promotionnels (image/vidéo) par article",
         },
         {
             "name": "Organization article orders",
@@ -63,6 +71,14 @@ app = FastAPI(
         {
             "name": "Customer sales",
             "description": "Commandes client, retrait, livraison, vente hors système",
+        },
+        {
+            "name": "Performance",
+            "description": "Rapports mensuels, financiers et analytics par organisation",
+        },
+        {
+            "name": "Customer analytics",
+            "description": "Tracking customer pour tendances et recommandations",
         },
         {
             "name": "Customer params",
@@ -108,10 +124,12 @@ app.include_router(users_router)
 app.include_router(admin_router)
 app.include_router(player_router)
 app.include_router(organizations_router)
+app.include_router(organization_subscriptions_router)
 app.include_router(members_router)
 app.include_router(organization_articles_router)
 app.include_router(organization_article_orders_router)
+app.include_router(performance_router)
 app.include_router(messaging_router)
+app.include_router(customer_sales_delivery_router)
 app.include_router(customer_sales_customer_router)
 app.include_router(customer_sales_org_router)
-app.include_router(customer_sales_delivery_router)

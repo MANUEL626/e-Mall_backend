@@ -110,7 +110,7 @@ def list_my_customer_sale_orders(
     try:
         rows = _service.list_customer_orders(user_id, group)
         return [_detail_from_row(r) for r in rows]
-    except LookupError as exc:
+    except (LookupError, PermissionError) as exc:
         raise _exc(exc, user_id) from exc
 
 
@@ -157,7 +157,7 @@ def list_my_delivery_track(
             user_id, str(order_id), since=since, limit=limit
         )
         return [DeliveryTrackPointOut.model_validate(r) for r in rows]
-    except LookupError as exc:
+    except (LookupError, PermissionError) as exc:
         raise _exc(exc, user_id) from exc
 
 

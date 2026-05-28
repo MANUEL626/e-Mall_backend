@@ -6,6 +6,7 @@ Opérations via service_role après contrôle JWT côté routes.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import secrets
 from decimal import Decimal, ROUND_HALF_UP
@@ -16,6 +17,7 @@ from supabase import Client
 from postgrest.exceptions import APIError
 
 from config.supabase_client import supabase_admin
+from features.customers.customer_analytics_service import CustomerAnalyticsService
 from features.customer_sales.customer_sales_models import (
     ConfirmReceiptBody,
     CustomerSaleFulfillment,
@@ -26,7 +28,15 @@ from features.customer_sales.customer_sales_models import (
     StatusGroup,
     WalkInSaleCreate,
 )
-from features.organization_articles.organization_articles_models import ArticleCategory
+from features.organization_articles.organization_articles_models import ArticleCategory, CurrencyCode
+from features.organization_subscriptions.organization_subscriptions_service import (
+    OrganizationSubscriptionFeatureDenied,
+    OrganizationSubscriptionLimitExceeded,
+    OrganizationSubscriptionService,
+)
+
+
+_logger = logging.getLogger(__name__)
 
 
 def _qr_pepper() -> str:
@@ -51,6 +61,8 @@ _STATUSES_FOR_GROUP: Dict[StatusGroup, List[str]] = {
 class CustomerSalesService:
     def __init__(self) -> None:
         self.db: Client = supabase_admin
+        self.analytics = CustomerAnalyticsService()
+        self.subscriptions = OrganizationSubscriptionService()
 
     # --- helpers ---
 
@@ -237,7 +249,7 @@ class CustomerSalesService:
         res = (
             self.db.table("organization_articles")
             .select(
-                "id,organization_id,name,unit_sale_price,stock_quantity,reserved_quantity,active"
+                "id,organization_id,name,unit_sale_price,sale_currency,stock_quantity,reserved_quantity,active"
             )
             .eq("organization_id", organization_id)
             .in_("id", article_ids)
@@ -252,6 +264,24 @@ class CustomerSalesService:
             if not r.get("active"):
                 raise ValueError(f"Article inactif : {aid}")
         return by_id
+
+    def _organization_default_sale_currency(self, organization_id: str) -> str:
+        res = (
+            self.db.table("organizations")
+            .select("default_currencies")
+            .eq("id", organization_id)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        defaults = rows[0].get("default_currencies") if rows else None
+        sale = (
+            str(defaults.get("sale") or CurrencyCode.xof.value).strip().lower()
+            if isinstance(defaults, dict)
+            else CurrencyCode.xof.value
+        )
+        allowed = {c.value for c in CurrencyCode}
+        return sale if sale in allowed else CurrencyCode.xof.value
 
     def _org_has_active_delivery_member(self, organization_id: str) -> bool:
         """
@@ -291,6 +321,14 @@ class CustomerSalesService:
             raise ValueError("Utiliser l'endpoint marchand walk-in pour ce type")
 
         oid = str(body.organization_id)
+        if body.fulfillment_type in (
+            CustomerSaleFulfillment.pickup,
+            CustomerSaleFulfillment.delivery,
+        ):
+            try:
+                self.subscriptions.assert_feature_enabled(oid, "pickup_delivery")
+            except OrganizationSubscriptionFeatureDenied as exc:
+                raise PermissionError(str(exc)) from exc
         lon = body.delivery_longitude
         lat = body.delivery_latitude
         if body.fulfillment_type == CustomerSaleFulfillment.delivery:
@@ -313,6 +351,14 @@ class CustomerSalesService:
 
         article_ids = [str(l.article_id) for l in body.lines]
         arts = self._fetch_articles_for_order(oid, article_ids)
+        default_currency = self._organization_default_sale_currency(oid)
+        line_currencies = {
+            str(arts[str(line.article_id)].get("sale_currency") or default_currency).lower()
+            for line in body.lines
+        }
+        if len(line_currencies) > 1:
+            raise ValueError("Une commande ne peut pas melanger plusieurs devises")
+        order_currency = next(iter(line_currencies), default_currency)
 
         oins = (
             self.db.table("organization_customer_sale_orders")
@@ -322,6 +368,7 @@ class CustomerSalesService:
                     "fulfillment_type": body.fulfillment_type.value,
                     "customer_id": cid,
                     "status": CustomerSaleOrderStatus.pending.value,
+                    "currency": order_currency,
                     "delivery_longitude": lon,
                     "delivery_latitude": lat,
                     "notes": body.notes.strip() if body.notes else None,
@@ -338,12 +385,14 @@ class CustomerSalesService:
         for ln in body.lines:
             aid = str(ln.article_id)
             price = arts[aid]["unit_sale_price"]
+            currency = str(arts[aid].get("sale_currency") or order_currency).lower()
             line_rows.append(
                 {
                     "order_id": order_id,
                     "article_id": aid,
                     "quantity": ln.quantity,
                     "unit_price_snapshot": float(price),
+                    "currency_snapshot": currency,
                 }
             )
 
@@ -424,6 +473,58 @@ class CustomerSalesService:
         self._attach_order_totals(row)
         return row
 
+    def _attach_lines_to_orders(
+        self,
+        orders: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not orders:
+            return []
+
+        order_ids = [str(order["id"]) for order in orders if order.get("id")]
+        if not order_ids:
+            return orders
+
+        lres = (
+            self.db.table("organization_customer_sale_order_lines")
+            .select("*")
+            .in_("order_id", order_ids)
+            .execute()
+        )
+        lines = list(lres.data or [])
+        article_ids = list(
+            {str(line["article_id"]) for line in lines if line.get("article_id")}
+        )
+
+        article_name_by_id: Dict[str, str] = {}
+        if article_ids:
+            ares = (
+                self.db.table("organization_articles")
+                .select("id,name")
+                .in_("id", article_ids)
+                .execute()
+            )
+            for article in ares.data or []:
+                article_name_by_id[str(article["id"])] = str(article.get("name") or "")
+
+        lines_by_order: Dict[str, List[Dict[str, Any]]] = {
+            order_id: [] for order_id in order_ids
+        }
+        for line in lines:
+            aid = str(line.get("article_id"))
+            line["article_name"] = article_name_by_id.get(aid)
+            lines_by_order.setdefault(str(line["order_id"]), []).append(line)
+
+        out: List[Dict[str, Any]] = []
+        for order in orders:
+            row = dict(order)
+            row["organization_customer_sale_order_lines"] = lines_by_order.get(
+                str(order["id"]),
+                [],
+            )
+            self._attach_order_totals(row)
+            out.append(row)
+        return out
+
     @staticmethod
     def _attach_order_totals(order_row: Dict[str, Any]) -> None:
         lines = list(order_row.get("organization_customer_sale_order_lines") or [])
@@ -459,7 +560,7 @@ class CustomerSalesService:
             q = q.in_("status", list(statuses))
         res = q.execute()
         rows = res.data or []
-        return [self._select_order_with_lines(str(r["id"])) for r in rows]
+        return self._attach_lines_to_orders(list(rows))
 
     def get_customer_order(self, user_id: str, order_id: str) -> Dict[str, Any]:
         cid = self.get_customer_id_for_user(user_id)
@@ -517,7 +618,9 @@ class CustomerSalesService:
         except Exception as exc:
             raise ValueError(str(exc)) from exc
 
-        return self._select_order_with_lines(order_id)
+        completed_order = self._select_order_with_lines(order_id)
+        self._create_purchase_trend_events(completed_order)
+        return completed_order
 
     # --- organisation ---
 
@@ -539,7 +642,7 @@ class CustomerSalesService:
             q = q.in_("status", list(statuses))
         res = q.execute()
         rows = res.data or []
-        return [self._select_order_with_lines(str(r["id"])) for r in rows]
+        return self._attach_lines_to_orders(list(rows))
 
     def get_org_order(
         self, user_id: str, organization_id: str, order_id: str
@@ -567,9 +670,25 @@ class CustomerSalesService:
         self, user_id: str, organization_id: str, body: WalkInSaleCreate
     ) -> Dict[str, Any]:
         self.assert_org_member(user_id, organization_id)
+        try:
+            self.subscriptions.assert_usage_below_limit(
+                organization_id,
+                "monthly_walk_in_sales",
+                increment=1,
+            )
+        except OrganizationSubscriptionLimitExceeded as exc:
+            raise ValueError(str(exc)) from exc
 
         article_ids = [str(l.article_id) for l in body.lines]
         arts = self._fetch_articles_for_order(organization_id, article_ids)
+        default_currency = self._organization_default_sale_currency(organization_id)
+        line_currencies = {
+            str(arts[str(line.article_id)].get("sale_currency") or default_currency).lower()
+            for line in body.lines
+        }
+        if len(line_currencies) > 1:
+            raise ValueError("Une vente magasin ne peut pas melanger plusieurs devises")
+        order_currency = next(iter(line_currencies), default_currency)
         for ln in body.lines:
             aid = str(ln.article_id)
             art = arts[aid]
@@ -591,6 +710,7 @@ class CustomerSalesService:
                     "fulfillment_type": CustomerSaleFulfillment.walk_in_offline.value,
                     "customer_id": None,
                     "status": CustomerSaleOrderStatus.completed.value,
+                    "currency": order_currency,
                     "notes": body.notes.strip() if body.notes else None,
                     "external_customer_label": body.external_customer_label.strip()
                     if body.external_customer_label
@@ -608,12 +728,14 @@ class CustomerSalesService:
         for ln in body.lines:
             aid = str(ln.article_id)
             price = arts[aid]["unit_sale_price"]
+            currency = str(arts[aid].get("sale_currency") or order_currency).lower()
             line_rows.append(
                 {
                     "order_id": order_id,
                     "article_id": aid,
                     "quantity": ln.quantity,
                     "unit_price_snapshot": float(price),
+                    "currency_snapshot": currency,
                 }
             )
 
@@ -648,7 +770,18 @@ class CustomerSalesService:
             created_by_user_id=user_id,
         )
 
-        return self._select_order_with_lines(order_id)
+        completed_order = self._select_order_with_lines(order_id)
+        self._create_purchase_trend_events(completed_order)
+        return completed_order
+
+    def _create_purchase_trend_events(self, order_row: Dict[str, Any]) -> None:
+        try:
+            self.analytics.create_purchase_events_for_order(order_row)
+        except Exception:
+            _logger.exception(
+                "Failed to create purchase trend events for customer sale order %s",
+                order_row.get("id"),
+            )
 
     def patch_order_status(
         self,
@@ -798,6 +931,13 @@ class CustomerSalesService:
         member_id: str,
     ) -> Dict[str, Any]:
         self.assert_org_member(user_id, organization_id)
+        try:
+            self.subscriptions.assert_feature_enabled(
+                organization_id,
+                "delivery_assignment",
+            )
+        except OrganizationSubscriptionFeatureDenied as exc:
+            raise PermissionError(str(exc)) from exc
         row = self.get_org_order(user_id, organization_id, order_id)
         if row["fulfillment_type"] != CustomerSaleFulfillment.delivery.value:
             raise ValueError("Commande non livrable")
@@ -869,7 +1009,7 @@ class CustomerSalesService:
             .execute()
         )
         rows = res.data or []
-        return [self._select_order_with_lines(str(r["id"])) for r in rows]
+        return self._attach_lines_to_orders(list(rows))
 
     def _assert_user_activity(self, user_id: str) -> None:
         ures = (
@@ -928,6 +1068,10 @@ class CustomerSalesService:
         ):
             raise ValueError("Commande terminée : envoi de position impossible")
         org_id = str(o["organization_id"])
+        try:
+            self.subscriptions.assert_feature_enabled(org_id, "realtime_gps")
+        except OrganizationSubscriptionFeatureDenied as exc:
+            raise PermissionError(str(exc)) from exc
         m = self._get_member(user_id, org_id)
         if m.get("member_role") != "delivery_management":
             raise PermissionError("Rôle livreur requis")
@@ -974,6 +1118,13 @@ class CustomerSalesService:
             raise LookupError("Commande introuvable")
         if row["fulfillment_type"] != CustomerSaleFulfillment.delivery.value:
             return []
+        try:
+            self.subscriptions.assert_feature_enabled(
+                str(row.get("organization_id")),
+                "realtime_gps",
+            )
+        except OrganizationSubscriptionFeatureDenied as exc:
+            raise PermissionError(str(exc)) from exc
         return self._query_delivery_track_points(
             order_id, since=since, limit=limit
         )
@@ -991,6 +1142,10 @@ class CustomerSalesService:
         row = self._select_order_with_lines(order_id)
         if row["fulfillment_type"] != CustomerSaleFulfillment.delivery.value:
             return []
+        try:
+            self.subscriptions.assert_feature_enabled(organization_id, "realtime_gps")
+        except OrganizationSubscriptionFeatureDenied as exc:
+            raise PermissionError(str(exc)) from exc
         return self._query_delivery_track_points(
             order_id, since=since, limit=limit
         )

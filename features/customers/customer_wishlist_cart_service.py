@@ -13,7 +13,7 @@ from features.customers.customer_catalog_service import CustomerCatalogService
 
 class CustomerWishlistCartService:
     _ARTICLE_FIELDS = (
-        "id, organization_id, name, category, unit_sale_price, stock_status, "
+        "id, organization_id, name, category, unit_sale_price, sale_currency, stock_status, "
         "primary_image_storage_path, additional_image_storage_paths, description, active"
     )
 

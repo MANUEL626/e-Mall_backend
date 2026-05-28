@@ -2,9 +2,10 @@
 Catalogue produits pour customers : lecture via service role (hors RLS membre).
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from zoneinfo import ZoneInfo
 
 from supabase import Client
 
@@ -12,8 +13,18 @@ from config.supabase_client import supabase_admin
 
 
 class CustomerCatalogService:
+    DEFAULT_TIMEZONE = "Africa/Lome"
+    TREND_EVENT_TYPES = (
+        "search",
+        "view",
+        "post_view",
+        "wishlist_add",
+        "cart_add",
+        "purchase",
+        "cart_abandon",
+    )
     _SELECT_FIELDS = (
-        "id, organization_id, name, category, unit_sale_price, stock_status, "
+        "id, organization_id, name, category, unit_sale_price, sale_currency, stock_status, "
         "primary_image_storage_path, additional_image_storage_paths, description, "
         "created_at, updated_at"
     )
@@ -183,6 +194,7 @@ class CustomerCatalogService:
                     "name": r["name"],
                     "category": r["category"],
                     "unit_sale_price": Decimal(str(r["unit_sale_price"])),
+                    "sale_currency": r.get("sale_currency") or "xof",
                     "stock_status": r["stock_status"],
                     "primary_image_storage_path": r["primary_image_storage_path"],
                     "additional_image_storage_paths": add_paths,
@@ -235,9 +247,12 @@ class CustomerCatalogService:
             max_price=max_price,
         )
         q = q.order("created_at", desc=True)
+        q = q.range(offset, offset + max(limit, 1) - 1)
         res = q.execute()
         rows = list(res.data or [])
         total = int(res.count) if res.count is not None else len(rows)
+        if not customer_id:
+            return self._rows_to_products(rows), total
         sorted_rows, org_map = self._sort_rows_for_customer(
             rows,
             customer_id=customer_id,
@@ -315,17 +330,114 @@ class CustomerCatalogService:
             self.db.table("customer_article_post_feed")
             .select("*", count="exact")
             .order("post_created_at", desc=True)
+            .range(offset, offset + max(limit, 1) - 1)
             .execute()
         )
         rows = list(res.data or [])
         total = int(res.count) if res.count is not None else len(rows)
+        if not customer_id:
+            return self._feed_rows_to_items(rows), total
         sorted_rows, org_map = self._sort_rows_for_customer(
             rows,
             customer_id=customer_id,
             date_field="post_created_at",
         )
-        page = sorted_rows[offset : offset + max(limit, 1)]
-        return self._feed_rows_to_items(page, org_map), total
+        return self._feed_rows_to_items(sorted_rows, org_map), total
+
+    def list_trending_products(
+        self,
+        *,
+        customer_id: str,
+        period: str = "30d",
+        limit: int = 20,
+        country: Optional[str] = None,
+        category: Optional[str] = None,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        start, end = self._trend_period_window(period)
+        context = self._customer_context(customer_id)
+        requested_country = self._normalize_country(country) or context.get("country")
+        requested_category = category.strip() if isinstance(category, str) and category.strip() else None
+        if requested_category:
+            context["interests"] = set(context.get("interests", set())) | {requested_category}
+
+        trend_query = (
+            self.db.table("customer_article_trend_events")
+            .select("article_id,event_type,weight")
+            .gte("occurred_at", start.isoformat())
+            .lt("occurred_at", end.isoformat())
+        )
+        metrics: Dict[str, Dict[str, Any]] = {}
+        for event in self._execute_paged(trend_query):
+            article_id = event.get("article_id")
+            if not article_id:
+                continue
+            event_type = str(event.get("event_type") or "")
+            if event_type not in self.TREND_EVENT_TYPES:
+                continue
+            article_key = str(article_id)
+            metric = metrics.setdefault(
+                article_key,
+                {
+                    "trend_score": Decimal("0"),
+                    "events": {key: 0 for key in self.TREND_EVENT_TYPES},
+                },
+            )
+            metric["events"][event_type] += 1
+            metric["trend_score"] += Decimal(str(event.get("weight") or "0"))
+
+        if not metrics:
+            return [], 0
+
+        article_rows: List[Dict[str, Any]] = []
+        for chunk in self._chunks(list(metrics.keys()), 200):
+            article_query = (
+                self.db.table("organization_articles")
+                .select(self._SELECT_FIELDS)
+                .eq("active", True)
+                .in_("id", chunk)
+            )
+            if requested_category:
+                article_query = article_query.eq("category", requested_category)
+            article_rows.extend(self._execute_paged(article_query))
+
+        if not article_rows:
+            return [], 0
+
+        org_map = self._organization_context(
+            [str(row["organization_id"]) for row in article_rows if row.get("organization_id")]
+        )
+
+        def sort_key(row: Dict[str, Any]):
+            article_id = str(row["id"])
+            metric = metrics.get(article_id, {})
+            score = Decimal(str(metric.get("trend_score") or "0"))
+            relevance = self._relevance_score(row, org=org_map.get(str(row.get("organization_id"))), context=context)
+            org = org_map.get(str(row.get("organization_id") or "")) or {}
+            org_countries = org.get("countries") if isinstance(org.get("countries"), list) else []
+            country_bonus = 0
+            if requested_country and requested_country in {
+                c.strip().upper() for c in org_countries if isinstance(c, str)
+            }:
+                country_bonus = 50
+            stock_bonus = 20 if row.get("stock_status") != "out_of_stock" else 0
+            return (
+                -(score + Decimal(relevance + country_bonus + stock_bonus)),
+                str(row.get("name") or ""),
+            )
+
+        sorted_rows = sorted(article_rows, key=sort_key)
+        page = sorted_rows[: max(limit, 1)]
+        products = self._rows_to_products(page, org_map)
+        out = []
+        for product in products:
+            article_id = str(product["id"])
+            metric = metrics.get(article_id, {})
+            product["trend_score"] = Decimal(str(metric.get("trend_score") or "0"))
+            product["events"] = metric.get("events") or {
+                key: 0 for key in self.TREND_EVENT_TYPES
+            }
+            out.append(product)
+        return out, len(article_rows)
 
     def _feed_rows_to_items(
         self,
@@ -353,6 +465,7 @@ class CustomerCatalogService:
                     "name": r["name"],
                     "category": r["category"],
                     "unit_sale_price": Decimal(str(r["unit_sale_price"])),
+                    "sale_currency": r.get("sale_currency") or "xof",
                     "stock_status": r["stock_status"],
                     "primary_image_storage_path": r["primary_image_storage_path"],
                     "additional_image_storage_paths": add_paths,
@@ -370,3 +483,33 @@ class CustomerCatalogService:
                 }
             )
         return out
+
+    def _trend_period_window(self, period: str) -> Tuple[datetime, datetime]:
+        tz = ZoneInfo(self.DEFAULT_TIMEZONE)
+        end = datetime.now(tz)
+        if period == "7d":
+            return end - timedelta(days=7), end
+        if period == "30d":
+            return end - timedelta(days=30), end
+        if period == "90d":
+            return end - timedelta(days=90), end
+        year_start = datetime(end.year, 1, 1, tzinfo=tz)
+        return year_start, end
+
+    @staticmethod
+    def _chunks(values: List[str], size: int):
+        for index in range(0, len(values), size):
+            yield values[index : index + size]
+
+    def _execute_paged(self, query: Any) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        offset = 0
+        page_size = 1000
+        while True:
+            res = query.range(offset, offset + page_size - 1).execute()
+            batch = list(res.data or [])
+            rows.extend(batch)
+            if len(batch) < page_size:
+                break
+            offset += page_size
+        return rows

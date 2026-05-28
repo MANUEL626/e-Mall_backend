@@ -51,6 +51,7 @@ async def register_member_and_organization(body: RegisterMemberOrganizationReque
             organization_description=body.organization_description,
             organization_profile_picture=body.organization_profile_picture,
             organization_countries=body.organization_countries,
+            organization_default_currencies=body.organization_default_currencies.model_dump(mode="json"),
             email=str(body.email),
             password=body.password,
             member_first_name=body.member_first_name,
@@ -100,6 +101,11 @@ def update_organization_profile(
             description=body.description,
             profile_picture=body.profile_picture,
             countries=body.countries,
+            default_currencies=(
+                body.default_currencies.model_dump(mode="json")
+                if body.default_currencies is not None
+                else None
+            ),
         )
     except OrganizationNotFound as exc:
         raise HTTPException(

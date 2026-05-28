@@ -10,7 +10,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from features.organization_articles.organization_articles_models import ArticleCategory
+from features.organization_articles.organization_articles_models import ArticleCategory, CurrencyCode
 
 
 class CustomerSaleFulfillment(str, Enum):
@@ -127,6 +127,7 @@ class SaleOrderLineOut(BaseModel):
     article_name: Optional[str] = None
     quantity: int
     unit_price_snapshot: Decimal
+    currency_snapshot: CurrencyCode = CurrencyCode.xof
 
 
 class SaleOrderOut(BaseModel):
@@ -138,7 +139,7 @@ class SaleOrderOut(BaseModel):
     assigned_delivery_member_id: Optional[UUID] = None
     delivery_longitude: Optional[float] = None
     delivery_latitude: Optional[float] = None
-    currency: Optional[str] = None
+    currency: CurrencyCode = CurrencyCode.xof
     notes: Optional[str] = None
     external_customer_label: Optional[str] = None
     subtotal_amount: Decimal

@@ -96,7 +96,10 @@ class MembersService:
             memberships.append(entry)
 
         auth_snap = self._public_auth_snapshot(go_true_user) if go_true_user else None
-        params = self.get_or_create_member_params(user_id)
+        params = self.get_or_create_member_params(
+            user_id,
+            ensure_member_user=False,
+        )
 
         return {
             "user": user,
@@ -155,8 +158,14 @@ class MembersService:
             return self._get_member_user(user_id)
         return rows[0]
 
-    def get_or_create_member_params(self, user_id: str) -> Dict[str, Any]:
-        self._get_member_user(user_id)
+    def get_or_create_member_params(
+        self,
+        user_id: str,
+        *,
+        ensure_member_user: bool = True,
+    ) -> Dict[str, Any]:
+        if ensure_member_user:
+            self._get_member_user(user_id)
         res = (
             self.db.table("member_params")
             .select("*")
