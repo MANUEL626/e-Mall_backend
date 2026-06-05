@@ -14,8 +14,14 @@ from features.organization_articles.organization_articles_models import (
     OrganizationArticleResponse,
     OrganizationArticleUpdate,
 )
+from features.organization_article_posts.organization_article_posts_models import (
+    OrganizationArticlePostResponse,
+)
 from features.organization_article_posts.organization_article_posts_route import (
     router as organization_article_posts_router,
+)
+from features.organization_article_posts.organization_article_posts_service import (
+    OrganizationArticlePostsService,
 )
 from features.organization_articles.organization_articles_service import (
     OrganizationArticlesService,
@@ -28,6 +34,7 @@ router = APIRouter(
 
 security = HTTPBearer()
 _service = OrganizationArticlesService()
+_posts_service = OrganizationArticlePostsService()
 _auth = AuthService()
 
 # Sous-ressource : `/articles/{article_id}/posts` — enregistré avant `GET /{article_id}` pour éviter
@@ -67,6 +74,37 @@ def list_organization_articles(
     except PermissionError as exc:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
+
+
+@router.get("/posts/batch", response_model=List[OrganizationArticlePostResponse])
+def list_organization_article_posts_batch(
+    organization_id: UUID,
+    article_ids: List[UUID] = Query(
+        ...,
+        min_length=1,
+        description="IDs d'articles a charger en une requete. Repeter article_ids=... pour chaque article.",
+    ),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    """Liste les posts de plusieurs articles sans faire un appel par article."""
+    uid = _current_user_id(credentials)
+    try:
+        rows = _posts_service.list_posts_for_articles(
+            uid,
+            str(organization_id),
+            [str(article_id) for article_id in article_ids],
+        )
+        return [OrganizationArticlePostResponse.model_validate(row) for row in rows]
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         ) from exc
 

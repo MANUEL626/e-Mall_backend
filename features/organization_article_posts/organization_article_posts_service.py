@@ -19,6 +19,10 @@ from features.organization_article_posts.video_processing_service import (
 from features.organization_articles.organization_articles_service import (
     OrganizationArticlesService,
 )
+from features.organization_subscriptions.organization_subscriptions_service import (
+    OrganizationSubscriptionFeatureDenied,
+    OrganizationSubscriptionService,
+)
 
 
 class OrganizationArticlePostsService:
@@ -30,6 +34,7 @@ class OrganizationArticlePostsService:
     def __init__(self) -> None:
         self.db: Client = supabase_admin
         self._articles = OrganizationArticlesService()
+        self.subscriptions = OrganizationSubscriptionService()
         self._video_processing = VideoProcessingService()
 
     @staticmethod
@@ -40,6 +45,12 @@ class OrganizationArticlePostsService:
         prefix = self._org_path_prefix(organization_id)
         if not path.strip().startswith(prefix):
             raise ValueError(self._BUCKET_PREFIX_RULE.format(organization_id=organization_id))
+
+    def _assert_article_posts_enabled(self, organization_id: str) -> None:
+        try:
+            self.subscriptions.assert_feature_enabled(organization_id, "article_posts")
+        except OrganizationSubscriptionFeatureDenied as exc:
+            raise PermissionError(str(exc)) from exc
 
     @staticmethod
     def _is_schema_cache_missing_column(exc: APIError) -> bool:
@@ -55,11 +66,47 @@ class OrganizationArticlePostsService:
         article_id: str,
     ) -> List[Dict[str, Any]]:
         self._articles.assert_org_member(user_id, organization_id)
+        self._assert_article_posts_enabled(organization_id)
         self._articles.get_article(user_id, organization_id, article_id)
         res = (
             self.db.table("organization_article_posts")
             .select("*")
             .eq("organization_article_id", article_id)
+            .order("slot")
+            .execute()
+        )
+        return list(res.data or [])
+
+    def list_posts_for_articles(
+        self,
+        user_id: str,
+        organization_id: str,
+        article_ids: List[str],
+    ) -> List[Dict[str, Any]]:
+        self._articles.assert_org_member(user_id, organization_id)
+        self._assert_article_posts_enabled(organization_id)
+
+        unique_article_ids = list(dict.fromkeys(str(article_id) for article_id in article_ids))
+        if not unique_article_ids:
+            return []
+
+        articles_res = (
+            self.db.table("organization_articles")
+            .select("id")
+            .eq("organization_id", organization_id)
+            .in_("id", unique_article_ids)
+            .execute()
+        )
+        found_ids = {str(row["id"]) for row in (articles_res.data or [])}
+        missing_ids = set(unique_article_ids) - found_ids
+        if missing_ids:
+            raise LookupError("Un ou plusieurs articles sont introuvables dans cette organisation")
+
+        res = (
+            self.db.table("organization_article_posts")
+            .select("*")
+            .in_("organization_article_id", unique_article_ids)
+            .order("organization_article_id")
             .order("slot")
             .execute()
         )
@@ -75,6 +122,7 @@ class OrganizationArticlePostsService:
         background_tasks: Optional[BackgroundTasks] = None,
     ) -> Dict[str, Any]:
         self._articles.assert_org_member(user_id, organization_id)
+        self._assert_article_posts_enabled(organization_id)
         self._articles.get_article(user_id, organization_id, article_id)
 
         oid = str(organization_id)
@@ -190,6 +238,7 @@ class OrganizationArticlePostsService:
         slot: int,
     ) -> None:
         self._articles.assert_org_member(user_id, organization_id)
+        self._assert_article_posts_enabled(organization_id)
         self._articles.get_article(user_id, organization_id, article_id)
         self.db.table("organization_article_posts").delete().eq(
             "organization_article_id", str(article_id)

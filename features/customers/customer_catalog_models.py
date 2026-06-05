@@ -16,6 +16,7 @@ from features.organization_article_posts.organization_article_posts_models impor
 from features.organization_articles.organization_articles_models import (
     ArticleCategory,
     ArticleStockStatus,
+    CurrencyCode,
 )
 
 
@@ -26,6 +27,7 @@ class CustomerCatalogProduct(BaseModel):
     name: str
     category: ArticleCategory
     unit_sale_price: Decimal = Field(..., ge=0)
+    sale_currency: CurrencyCode
     stock_status: ArticleStockStatus
     primary_image_storage_path: str
     additional_image_storage_paths: List[str] = Field(default_factory=list)
@@ -41,11 +43,35 @@ class CustomerCatalogPage(BaseModel):
     offset: int
 
 
+class CustomerTrendEventCounts(BaseModel):
+    search: int = 0
+    view: int = 0
+    post_view: int = 0
+    wishlist_add: int = 0
+    cart_add: int = 0
+    purchase: int = 0
+    cart_abandon: int = 0
+
+
+class CustomerTrendingProduct(CustomerCatalogProduct):
+    trend_score: Decimal
+    events: CustomerTrendEventCounts
+
+
+class CustomerTrendingProductsPage(BaseModel):
+    items: List[CustomerTrendingProduct]
+    total: int
+    limit: int
+    period_key: str
+    country: Optional[str] = None
+    category: Optional[ArticleCategory] = None
+
+
 class CustomerArticlePostPublic(BaseModel):
     """Post promo visible côté client (article actif, post actif)."""
 
     id: UUID
-    slot: int = Field(..., ge=1, le=3)
+    slot: int = Field(..., ge=1)
     media_kind: ArticlePostMediaKind
     media_storage_path: str
     video_mobile_low_storage_path: Optional[str] = None
@@ -72,11 +98,12 @@ class CustomerArticlePostFeedItem(BaseModel):
     name: str
     category: ArticleCategory
     unit_sale_price: Decimal = Field(..., ge=0)
+    sale_currency: CurrencyCode
     stock_status: ArticleStockStatus
     primary_image_storage_path: str
     additional_image_storage_paths: List[str] = Field(default_factory=list)
     description: Optional[str] = None
-    slot: int = Field(..., ge=1, le=3)
+    slot: int = Field(..., ge=1)
     media_kind: ArticlePostMediaKind
     media_storage_path: str
     video_mobile_low_storage_path: Optional[str] = None

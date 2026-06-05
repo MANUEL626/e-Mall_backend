@@ -8,6 +8,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
+from features.organization_articles.organization_articles_models import CurrencyCode
+
 
 class OrganizationCategory(str, Enum):
     """Valeurs de `public.organization_type_enum`."""
@@ -16,12 +18,20 @@ class OrganizationCategory(str, Enum):
     sales = "sales"
 
 
+class OrganizationDefaultCurrencies(BaseModel):
+    purchase: CurrencyCode = CurrencyCode.eur
+    sale: CurrencyCode = CurrencyCode.xof
+
+
 class RegisterMemberOrganizationRequest(BaseModel):
     organization_name: str = Field(..., min_length=1, max_length=500)
     organization_category: OrganizationCategory
     organization_description: Optional[str] = Field(None, max_length=10_000)
     organization_profile_picture: Optional[str] = Field(None, max_length=25_000_000)
     organization_countries: List[str] = Field(default_factory=list)
+    organization_default_currencies: OrganizationDefaultCurrencies = Field(
+        default_factory=OrganizationDefaultCurrencies
+    )
     email: EmailStr
     password: str = Field(..., min_length=8, max_length=128)
     member_first_name: Optional[str] = Field(None, max_length=50)
@@ -66,6 +76,9 @@ class RegisterMemberOrganizationResponse(BaseModel):
     organization_id: UUID
     organization_profile_picture: Optional[str] = None
     organization_countries: List[str] = Field(default_factory=list)
+    organization_default_currencies: OrganizationDefaultCurrencies = Field(
+        default_factory=OrganizationDefaultCurrencies
+    )
     member_profile_picture: Optional[str] = None
     member_locale: str = "fr"
 
@@ -77,6 +90,7 @@ class UpdateOrganizationProfileRequest(BaseModel):
     description: Optional[str] = Field(None, max_length=10_000)
     profile_picture: Optional[str] = Field(None, max_length=25_000_000)
     countries: Optional[List[str]] = None
+    default_currencies: Optional[OrganizationDefaultCurrencies] = None
 
     @field_validator("countries")
     @classmethod
@@ -103,9 +117,10 @@ class UpdateOrganizationProfileRequest(BaseModel):
             and self.description is None
             and self.profile_picture is None
             and self.countries is None
+            and self.default_currencies is None
         ):
             raise ValueError(
-                "Au moins un parmi name, description, profile_picture, countries est requis"
+                "Au moins un parmi name, description, profile_picture, countries, default_currencies est requis"
             )
         return self
 

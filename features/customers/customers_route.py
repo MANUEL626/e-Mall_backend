@@ -8,12 +8,19 @@ from pydantic import BaseModel, Field
 
 from config.supabase_client import get_supabase_client_with_token
 from features.auth.auth_service import AuthService
+from features.customers.customer_analytics_models import (
+    CustomerArticleTrendEventCreate,
+    CustomerArticleTrendEventResponse,
+)
+from features.customers.customer_analytics_service import CustomerAnalyticsService
 from features.customers.customer_catalog_models import (
     CustomerArticlePostFeedItem,
     CustomerArticlePostFeedPage,
     CustomerArticlePostPublic,
     CustomerCatalogPage,
     CustomerCatalogProduct,
+    CustomerTrendingProduct,
+    CustomerTrendingProductsPage,
 )
 from features.customers.customer_catalog_service import CustomerCatalogService
 from features.customers.customer_i18n import CustomerI18nService
@@ -39,10 +46,12 @@ from features.customers.customer_wishlist_cart_service import CustomerWishlistCa
 from features.customer_sales.customer_sales_models import CustomerParamsOut, CustomerParamsPatch
 from features.customer_sales.customer_sales_service import CustomerSalesService
 from features.organization_articles.organization_articles_models import ArticleCategory
+from features.performance.performance_models import PerformancePeriod
 
 security = HTTPBearer()
 _auth = AuthService()
 _catalog = CustomerCatalogService()
+_analytics = CustomerAnalyticsService()
 _wish_cart = CustomerWishlistCartService()
 _subscriptions = CustomerSubscriptionsService()
 _customer_sales = CustomerSalesService()
@@ -206,6 +215,40 @@ def list_customer_article_post_feed(
     )
 
 
+@router.post(
+    "/analytics/article-events",
+    response_model=CustomerArticleTrendEventResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Customer analytics"],
+)
+def create_customer_article_trend_event(
+    body: CustomerArticleTrendEventCreate,
+    customer_id: str = Depends(require_customer_id),
+):
+    """
+    Enregistre un signal customer pour les futurs produits tendance.
+    Les achats confirmÃ©s (`purchase`) seront crÃ©Ã©s automatiquement cÃ´tÃ© backend.
+    """
+    try:
+        row = _analytics.create_article_event(customer_id=customer_id, body=body)
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=_customer_detail(customer_id, str(exc)),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_customer_detail(customer_id, str(exc)),
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=_customer_detail(customer_id, str(exc)),
+        ) from exc
+    return CustomerArticleTrendEventResponse.model_validate(row)
+
+
 @router.get("/products", response_model=CustomerCatalogPage)
 def list_customer_catalog_products(
     customer_id: str = Depends(require_customer_id),
@@ -226,6 +269,44 @@ def list_customer_catalog_products(
         total=total,
         limit=limit,
         offset=offset,
+    )
+
+
+@router.get("/trending-products", response_model=CustomerTrendingProductsPage)
+def list_customer_trending_products(
+    period: PerformancePeriod = Query(
+        PerformancePeriod.d30,
+        description="PÃ©riode Ã  analyser : 7d, 30d, 90d ou year.",
+    ),
+    country: Optional[str] = Query(
+        None,
+        min_length=2,
+        max_length=2,
+        description="Pays ISO alpha-2 optionnel. Si omis, customer_params est utilisÃ©.",
+    ),
+    category: Optional[ArticleCategory] = Query(
+        None,
+        description="CatÃ©gorie Ã  recommander en prioritÃ©.",
+    ),
+    limit: int = Query(20, ge=1, le=100),
+    customer_id: str = Depends(require_customer_id),
+):
+    """Produits tendance recommandÃ©s au customer connectÃ©."""
+
+    rows, total = _catalog.list_trending_products(
+        customer_id=customer_id,
+        period=period.value,
+        limit=limit,
+        country=country,
+        category=category.value if category else None,
+    )
+    return CustomerTrendingProductsPage(
+        items=[CustomerTrendingProduct.model_validate(r) for r in rows],
+        total=total,
+        limit=limit,
+        period_key=period.value,
+        country=country.upper() if country else None,
+        category=category,
     )
 
 

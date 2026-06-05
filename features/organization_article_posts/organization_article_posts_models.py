@@ -1,5 +1,5 @@
 """
-Modeles Pydantic : posts promotionnels par article (slot 1-3).
+Modeles Pydantic : posts promotionnels par article.
 """
 
 from datetime import datetime
@@ -27,7 +27,7 @@ class ArticlePostProcessingStatus(str, Enum):
 
 
 class OrganizationArticlePostUpsert(BaseModel):
-    """Creation ou remplacement du contenu a l'emplacement `slot` (1-3)."""
+    """Creation ou remplacement du contenu a l'emplacement `slot`."""
 
     media_kind: ArticlePostMediaKind
     media_storage_path: str = Field(..., min_length=1, max_length=1024)
@@ -39,7 +39,7 @@ class OrganizationArticlePostUpsert(BaseModel):
 class OrganizationArticlePostResponse(BaseModel):
     id: UUID
     organization_article_id: UUID
-    slot: int = Field(..., ge=1, le=3)
+    slot: int = Field(..., ge=1)
     media_kind: ArticlePostMediaKind
     media_storage_path: str
     original_media_storage_path: Optional[str] = None

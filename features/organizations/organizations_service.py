@@ -10,6 +10,10 @@ import requests
 from supabase import Client
 
 from config.supabase_client import SUPABASE_ANON_KEY, SUPABASE_URL, supabase_admin
+from features.organization_subscriptions.organization_subscriptions_service import (
+    OrganizationSubscriptionLimitExceeded,
+    OrganizationSubscriptionService,
+)
 
 
 class OrganizationInviteForbidden(Exception):
@@ -27,6 +31,7 @@ class OrganizationMemberNotFound(Exception):
 class OrganizationsService:
     def __init__(self) -> None:
         self.db: Client = supabase_admin
+        self.subscriptions = OrganizationSubscriptionService()
 
     @staticmethod
     def _generated_username(user_id: str) -> str:
@@ -54,6 +59,18 @@ class OrganizationsService:
         return value
 
     @staticmethod
+    def _normalize_default_currencies(default_currencies: Optional[Dict[str, Any]]) -> Dict[str, str]:
+        allowed = {"xof", "eur", "usd", "gbp", "cny", "ngn", "ghs"}
+        raw = default_currencies or {}
+        purchase = str(raw.get("purchase") or "eur").strip().lower()
+        sale = str(raw.get("sale") or "xof").strip().lower()
+        if purchase not in allowed:
+            raise ValueError("Devise d'achat non supportee")
+        if sale not in allowed:
+            raise ValueError("Devise de vente non supportee")
+        return {"purchase": purchase, "sale": sale}
+
+    @staticmethod
     def _auth_error_message(exc: Exception) -> str:
         msg = str(exc).strip().lower()
         if "already" in msg or "registered" in msg or "exists" in msg:
@@ -69,6 +86,7 @@ class OrganizationsService:
         password: str,
         organization_profile_picture: Optional[str] = None,
         organization_countries: Optional[List[str]] = None,
+        organization_default_currencies: Optional[Dict[str, Any]] = None,
         member_first_name: Optional[str] = None,
         member_last_name: Optional[str] = None,
         member_username: Optional[str] = None,
@@ -88,6 +106,9 @@ class OrganizationsService:
             else None
         )
         org_countries = self._normalize_countries(organization_countries)
+        org_default_currencies = self._normalize_default_currencies(
+            organization_default_currencies
+        )
         locale = self._normalize_locale(member_locale)
 
         user_id: Optional[str] = None
@@ -156,6 +177,7 @@ class OrganizationsService:
             "description": desc_clean,
             "profile_picture": org_picture,
             "countries": org_countries,
+            "default_currencies": org_default_currencies,
             "created_by": user_id,
         }
 
@@ -194,6 +216,7 @@ class OrganizationsService:
             "organization_id": org_id,
             "organization_profile_picture": org_picture,
             "organization_countries": org_countries,
+            "organization_default_currencies": org_default_currencies,
             "member_profile_picture": member_picture,
             "member_locale": locale,
         }
@@ -342,6 +365,15 @@ class OrganizationsService:
 
         if self._is_already_member(invited_user_id, organization_id):
             raise ValueError("Cet utilisateur est déjà membre de cette organisation")
+
+        try:
+            self.subscriptions.assert_usage_below_limit(
+                organization_id,
+                "team_members",
+                increment=1,
+            )
+        except OrganizationSubscriptionLimitExceeded as exc:
+            raise ValueError(str(exc)) from exc
 
         ures = (
             self.db.table("users")
@@ -494,6 +526,7 @@ class OrganizationsService:
         description: Optional[str] = None,
         profile_picture: Optional[str] = None,
         countries: Optional[List[str]] = None,
+        default_currencies: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         self._ensure_org_and_inviter(organization_id, actor_user_id)
         updates: Dict[str, Any] = {}
@@ -513,9 +546,14 @@ class OrganizationsService:
         if countries is not None:
             updates["countries"] = self._normalize_countries(countries)
 
+        if default_currencies is not None:
+            updates["default_currencies"] = self._normalize_default_currencies(
+                default_currencies
+            )
+
         if not updates:
             raise ValueError(
-                "Au moins un parmi name, description, profile_picture, countries est requis"
+                "Au moins un parmi name, description, profile_picture, countries, default_currencies est requis"
             )
 
         try:
@@ -602,6 +640,16 @@ class OrganizationsService:
             updates["member_type"] = member_type
         if member_role is not None:
             updates["member_role"] = member_role
+
+        if current.get("activity_status") is not True and activity_status is True:
+            try:
+                self.subscriptions.assert_usage_below_limit(
+                    organization_id,
+                    "team_members",
+                    increment=1,
+                )
+            except OrganizationSubscriptionLimitExceeded as exc:
+                raise ValueError(str(exc)) from exc
 
         ures = (
             self.db.table("members")

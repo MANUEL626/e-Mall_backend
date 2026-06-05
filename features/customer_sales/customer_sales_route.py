@@ -22,6 +22,7 @@ from features.customer_sales.customer_sales_models import (
     SaleOrderDetailOut,
     SaleOrderLineOut,
     SaleOrderOut,
+    SaleReceiptOut,
     StatusEventOut,
     StatusGroup,
     WalkInSaleCreate,
@@ -110,7 +111,19 @@ def list_my_customer_sale_orders(
     try:
         rows = _service.list_customer_orders(user_id, group)
         return [_detail_from_row(r) for r in rows]
-    except LookupError as exc:
+    except (LookupError, PermissionError) as exc:
+        raise _exc(exc, user_id) from exc
+
+
+@customer_router.get("/{order_id}/receipt", response_model=SaleReceiptOut)
+def get_my_customer_sale_receipt(
+    order_id: UUID,
+    user_id: str = Depends(_current_user_id),
+):
+    try:
+        row = _service.get_customer_order_receipt(user_id, str(order_id))
+        return SaleReceiptOut.model_validate(row)
+    except (LookupError, PermissionError, ValueError, RuntimeError) as exc:
         raise _exc(exc, user_id) from exc
 
 
@@ -157,7 +170,7 @@ def list_my_delivery_track(
             user_id, str(order_id), since=since, limit=limit
         )
         return [DeliveryTrackPointOut.model_validate(r) for r in rows]
-    except LookupError as exc:
+    except (LookupError, PermissionError) as exc:
         raise _exc(exc, user_id) from exc
 
 
@@ -277,6 +290,23 @@ def post_receipt_token(
             qr_payload=d["qr_payload"],
             expires_at=d.get("expires_at"),
         )
+    except (PermissionError, LookupError, ValueError, RuntimeError) as exc:
+        raise _exc(exc) from exc
+
+
+@org_router.get("/{order_id}/receipt", response_model=SaleReceiptOut)
+def get_org_customer_sale_receipt(
+    organization_id: UUID,
+    order_id: UUID,
+    user_id: str = Depends(_current_user_id),
+):
+    try:
+        row = _service.get_org_order_receipt(
+            user_id,
+            str(organization_id),
+            str(order_id),
+        )
+        return SaleReceiptOut.model_validate(row)
     except (PermissionError, LookupError, ValueError, RuntimeError) as exc:
         raise _exc(exc) from exc
 
