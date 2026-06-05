@@ -5,7 +5,7 @@ Modèles Pydantic : ventes client (alignés sur les enums Postgres).
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -152,6 +152,28 @@ class SaleOrderOut(BaseModel):
 class SaleOrderDetailOut(BaseModel):
     order: SaleOrderOut
     lines: List[SaleOrderLineOut]
+
+
+class SaleReceiptOut(BaseModel):
+    id: UUID
+    order_id: UUID
+    organization_id: UUID
+    customer_id: Optional[UUID] = None
+    receipt_number: str
+    currency: CurrencyCode = CurrencyCode.xof
+    subtotal_amount: Decimal
+    total_amount: Decimal
+    total_items: int
+    total_lines: int
+    fulfillment_type: CustomerSaleFulfillment
+    status: str
+    customer_label: Optional[str] = None
+    organization_snapshot: Dict[str, Any] = Field(default_factory=dict)
+    customer_snapshot: Optional[Dict[str, Any]] = None
+    lines_snapshot: List[Dict[str, Any]] = Field(default_factory=list)
+    issued_at: datetime
+    created_at: datetime
+    updated_at: datetime
 
 
 class StatusEventOut(BaseModel):

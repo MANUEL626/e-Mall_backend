@@ -3,6 +3,7 @@ Pydantic models for organization subscriptions.
 """
 
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, List, Optional
 from uuid import UUID
@@ -32,12 +33,22 @@ class OrganizationSubscriptionSource(str, Enum):
     promo = "promo"
 
 
+class OrganizationSubscriptionBillingInterval(str, Enum):
+    monthly = "monthly"
+    yearly = "yearly"
+
+
 class OrganizationSubscriptionPlanOut(BaseModel):
     code: OrganizationSubscriptionPlanCode
     name: str
     description: Optional[str] = None
     features: Dict[str, Any] = Field(default_factory=dict)
     limits: Dict[str, Any] = Field(default_factory=dict)
+    price_currency: str = "xof"
+    monthly_price_amount: Optional[Decimal] = None
+    yearly_price_amount: Optional[Decimal] = None
+    yearly_savings_amount: Optional[Decimal] = None
+    yearly_savings_percent: Optional[Decimal] = None
     stripe_product_id: Optional[str] = None
     stripe_monthly_price_id: Optional[str] = None
     stripe_yearly_price_id: Optional[str] = None
@@ -51,15 +62,52 @@ class OrganizationSubscriptionPlansResponse(BaseModel):
     plans: List[OrganizationSubscriptionPlanOut]
 
 
+class OrganizationSubscriptionCheckoutCreate(BaseModel):
+    plan: OrganizationSubscriptionPlanCode
+    billing_interval: OrganizationSubscriptionBillingInterval
+
+
+class OrganizationSubscriptionCheckoutResponse(BaseModel):
+    checkout_session_id: str
+    checkout_url: str
+
+
+class OrganizationSubscriptionPortalResponse(BaseModel):
+    portal_url: str
+
+
+class OrganizationSubscriptionInvoiceOut(BaseModel):
+    id: str
+    number: Optional[str] = None
+    status: Optional[str] = None
+    currency: Optional[str] = None
+    amount_due: int = 0
+    amount_paid: int = 0
+    amount_remaining: int = 0
+    created: Optional[datetime] = None
+    due_date: Optional[datetime] = None
+    period_start: Optional[datetime] = None
+    period_end: Optional[datetime] = None
+    hosted_invoice_url: Optional[str] = None
+    invoice_pdf: Optional[str] = None
+    subscription_id: Optional[str] = None
+
+
+class OrganizationSubscriptionInvoicesResponse(BaseModel):
+    invoices: List[OrganizationSubscriptionInvoiceOut]
+
+
 class OrganizationSubscriptionOut(BaseModel):
     organization_id: UUID
     plan: OrganizationSubscriptionPlanCode
     status: OrganizationSubscriptionStatus
     source: OrganizationSubscriptionSource
+    billing_interval: OrganizationSubscriptionBillingInterval = OrganizationSubscriptionBillingInterval.monthly
     current_period_start: Optional[datetime] = None
     current_period_end: Optional[datetime] = None
     trial_end: Optional[datetime] = None
     cancel_at_period_end: bool = False
+    stripe_price_id: Optional[str] = None
     stripe_customer_id: Optional[str] = None
     stripe_subscription_id: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
@@ -92,9 +140,11 @@ class OrganizationSubscriptionPatch(BaseModel):
     plan: Optional[OrganizationSubscriptionPlanCode] = None
     status: Optional[OrganizationSubscriptionStatus] = None
     source: Optional[OrganizationSubscriptionSource] = None
+    billing_interval: Optional[OrganizationSubscriptionBillingInterval] = None
     current_period_end: Optional[datetime] = None
     trial_end: Optional[datetime] = None
     cancel_at_period_end: Optional[bool] = None
+    stripe_price_id: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
 
     @model_validator(mode="after")
@@ -103,11 +153,12 @@ class OrganizationSubscriptionPatch(BaseModel):
             self.plan is None
             and self.status is None
             and self.source is None
+            and self.billing_interval is None
             and self.current_period_end is None
             and self.trial_end is None
             and self.cancel_at_period_end is None
+            and self.stripe_price_id is None
             and self.metadata is None
         ):
             raise ValueError("Au moins un champ d'abonnement est requis")
         return self
-

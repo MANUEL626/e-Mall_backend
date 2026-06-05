@@ -26,6 +26,7 @@ from features.members.members_route import router as members_router
 from features.organizations.organizations_route import router as organizations_router
 from features.organization_subscriptions.organization_subscriptions_route import (
     router as organization_subscriptions_router,
+    stripe_router,
 )
 from features.performance.performance_route import router as performance_router
 from features.users.users_route import router as users_router
@@ -125,6 +126,7 @@ app.include_router(admin_router)
 app.include_router(player_router)
 app.include_router(organizations_router)
 app.include_router(organization_subscriptions_router)
+app.include_router(stripe_router)
 app.include_router(members_router)
 app.include_router(organization_articles_router)
 app.include_router(organization_article_orders_router)

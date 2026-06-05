@@ -541,6 +541,192 @@ class CustomerSalesService:
         order_row["total_items"] = total_items
         order_row["total_lines"] = len(lines)
 
+    @staticmethod
+    def _money(value: Any) -> Decimal:
+        return Decimal(str(value or "0")).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+
+    @staticmethod
+    def _receipt_number(order_row: Dict[str, Any]) -> str:
+        created_at = str(order_row.get("created_at") or "")
+        compact_date = created_at[:10].replace("-", "") if created_at else "nodate"
+        return f"RCPT-{compact_date}-{str(order_row['id'])[:8].upper()}"
+
+    @staticmethod
+    def _public_org_snapshot(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not row:
+            return {}
+        keys = (
+            "id",
+            "name",
+            "org_type",
+            "profile_picture",
+            "default_currencies",
+        )
+        return {key: row.get(key) for key in keys if key in row}
+
+    @staticmethod
+    def _public_customer_snapshot(
+        customer: Optional[Dict[str, Any]],
+        user: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not customer and not user:
+            return None
+        snapshot: Dict[str, Any] = {}
+        if customer:
+            snapshot["id"] = customer.get("id")
+            snapshot["user_id"] = customer.get("user_id")
+        if user:
+            for key in (
+                "email",
+                "first_name",
+                "last_name",
+                "phone",
+                "profile_picture",
+                "username",
+            ):
+                if key in user:
+                    snapshot[key] = user.get(key)
+        return snapshot
+
+    def _select_receipt_by_order_id(self, order_id: str) -> Optional[Dict[str, Any]]:
+        res = (
+            self.db.table("customer_sale_receipts")
+            .select("*")
+            .eq("order_id", order_id)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        return rows[0] if rows else None
+
+    def _build_receipt_payload(self, order_row: Dict[str, Any]) -> Dict[str, Any]:
+        if order_row.get("status") != CustomerSaleOrderStatus.completed.value:
+            raise ValueError("Le reçu est disponible uniquement pour une vente terminée")
+
+        org_id = str(order_row["organization_id"])
+        org_res = (
+            self.db.table("organizations")
+            .select("*")
+            .eq("id", org_id)
+            .limit(1)
+            .execute()
+        )
+        org_rows = org_res.data or []
+        organization_snapshot = self._public_org_snapshot(
+            dict(org_rows[0]) if org_rows else None
+        )
+
+        customer_row: Optional[Dict[str, Any]] = None
+        user_row: Optional[Dict[str, Any]] = None
+        customer_id = order_row.get("customer_id")
+        if customer_id:
+            cust_res = (
+                self.db.table("customers")
+                .select("*")
+                .eq("id", str(customer_id))
+                .limit(1)
+                .execute()
+            )
+            cust_rows = cust_res.data or []
+            customer_row = dict(cust_rows[0]) if cust_rows else None
+            user_id = customer_row.get("user_id") if customer_row else None
+            if user_id:
+                user_res = (
+                    self.db.table("users")
+                    .select("*")
+                    .eq("id", str(user_id))
+                    .limit(1)
+                    .execute()
+                )
+                user_rows = user_res.data or []
+                user_row = dict(user_rows[0]) if user_rows else None
+
+        customer_label = order_row.get("external_customer_label")
+        if not customer_label and user_row:
+            names = [
+                str(user_row.get("first_name") or "").strip(),
+                str(user_row.get("last_name") or "").strip(),
+            ]
+            customer_label = " ".join([name for name in names if name]) or user_row.get(
+                "username"
+            )
+
+        lines_snapshot: List[Dict[str, Any]] = []
+        for line in order_row.get("organization_customer_sale_order_lines") or []:
+            qty = int(line.get("quantity") or 0)
+            unit_price = self._money(line.get("unit_price_snapshot"))
+            line_total = self._money(unit_price * qty)
+            lines_snapshot.append(
+                {
+                    "line_id": line.get("id"),
+                    "article_id": line.get("article_id"),
+                    "article_name": line.get("article_name"),
+                    "quantity": qty,
+                    "unit_price": str(unit_price),
+                    "currency": str(
+                        line.get("currency_snapshot")
+                        or order_row.get("currency")
+                        or CurrencyCode.xof.value
+                    ).lower(),
+                    "line_total": str(line_total),
+                }
+            )
+
+        subtotal = self._money(order_row.get("subtotal_amount"))
+        return {
+            "order_id": str(order_row["id"]),
+            "organization_id": org_id,
+            "customer_id": str(customer_id) if customer_id else None,
+            "receipt_number": self._receipt_number(order_row),
+            "currency": str(order_row.get("currency") or CurrencyCode.xof.value).lower(),
+            "subtotal_amount": float(subtotal),
+            "total_amount": float(subtotal),
+            "total_items": int(order_row.get("total_items") or 0),
+            "total_lines": int(order_row.get("total_lines") or len(lines_snapshot)),
+            "fulfillment_type": order_row["fulfillment_type"],
+            "status": "issued",
+            "customer_label": customer_label,
+            "organization_snapshot": organization_snapshot,
+            "customer_snapshot": self._public_customer_snapshot(customer_row, user_row),
+            "lines_snapshot": lines_snapshot,
+        }
+
+    def _ensure_receipt_for_completed_order(
+        self, order_row: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        order_id = str(order_row["id"])
+        existing = self._select_receipt_by_order_id(order_id)
+        if existing:
+            return existing
+
+        payload = self._build_receipt_payload(order_row)
+        try:
+            ins = self.db.table("customer_sale_receipts").insert(payload).execute()
+        except APIError:
+            existing = self._select_receipt_by_order_id(order_id)
+            if existing:
+                return existing
+            raise
+
+        rows = ins.data or []
+        if not rows:
+            raise RuntimeError("Création du reçu refusée")
+        return rows[0]
+
+    def get_customer_order_receipt(
+        self, user_id: str, order_id: str
+    ) -> Dict[str, Any]:
+        order = self.get_customer_order(user_id, order_id)
+        return self._ensure_receipt_for_completed_order(order)
+
+    def get_org_order_receipt(
+        self, user_id: str, organization_id: str, order_id: str
+    ) -> Dict[str, Any]:
+        order = self.get_org_order(user_id, organization_id, order_id)
+        return self._ensure_receipt_for_completed_order(order)
+
     def list_customer_orders(
         self,
         user_id: str,
@@ -619,6 +805,7 @@ class CustomerSalesService:
             raise ValueError(str(exc)) from exc
 
         completed_order = self._select_order_with_lines(order_id)
+        self._ensure_receipt_for_completed_order(completed_order)
         self._create_purchase_trend_events(completed_order)
         return completed_order
 
@@ -771,6 +958,7 @@ class CustomerSalesService:
         )
 
         completed_order = self._select_order_with_lines(order_id)
+        self._ensure_receipt_for_completed_order(completed_order)
         self._create_purchase_trend_events(completed_order)
         return completed_order
 
