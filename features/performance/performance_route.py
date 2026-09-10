@@ -2,6 +2,7 @@
 Routes Performance : rapports et analytics organisation.
 """
 
+from typing import Any, Dict
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -205,6 +206,25 @@ def get_inventory_summary(
     try:
         payload = _service.get_inventory_summary(user_id, str(organization_id))
         return InventorySummary.model_validate(payload)
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
+
+
+@router.get("/by-activity", response_model=Dict[str, Any])
+def get_activity_summary(
+    organization_id: UUID,
+    period: FinancialPeriod = Query(
+        FinancialPeriod.month,
+        description="Période à analyser : month, 7d, 30d, 90d ou year.",
+    ),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    user_id = _current_user_id(credentials)
+    try:
+        return _service.get_activity_summary(user_id, str(organization_id), period)
     except PermissionError as exc:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

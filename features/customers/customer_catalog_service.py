@@ -25,6 +25,7 @@ class CustomerCatalogService:
     )
     _SELECT_FIELDS = (
         "id, organization_id, name, category, unit_sale_price, sale_currency, stock_status, "
+        "stock_quantity, reserved_quantity, alert_quantity, "
         "primary_image_storage_path, additional_image_storage_paths, description, "
         "created_at, updated_at"
     )
@@ -113,6 +114,101 @@ class CustomerCatalogService:
         )
         return {str(o["id"]): o for o in (org_res.data or [])}
 
+    def _default_sales_shop_by_org(
+        self,
+        organization_ids: Sequence[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        org_ids = [str(oid) for oid in organization_ids if oid]
+        if not org_ids:
+            return {}
+        res = (
+            self.db.table("organization_shops")
+            .select("id, organization_id, name, shop_type, is_default, created_at")
+            .in_("organization_id", list(set(org_ids)))
+            .eq("shop_type", "sales")
+            .neq("status", "archived")
+            .order("created_at")
+            .execute()
+        )
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in res.data or []:
+            oid = str(row["organization_id"])
+            if oid not in out or row.get("is_default") is True:
+                out[oid] = row
+        return out
+
+    def _shop_context_by_id(self, shop_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not shop_id:
+            return None
+        res = (
+            self.db.table("organization_shops")
+            .select("id, organization_id, name, shop_type")
+            .eq("id", shop_id)
+            .eq("shop_type", "sales")
+            .neq("status", "archived")
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        return rows[0] if rows else None
+
+    def _attach_shop_stock(
+        self,
+        rows: List[Dict[str, Any]],
+        *,
+        requested_shop_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        if not rows:
+            return []
+        default_shop_by_org = self._default_sales_shop_by_org(
+            [str(row["organization_id"]) for row in rows if row.get("organization_id")]
+        )
+        requested_shop = self._shop_context_by_id(requested_shop_id)
+        shop_by_article: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            org_id = str(row["organization_id"])
+            shop = (
+                requested_shop
+                if requested_shop and str(requested_shop.get("organization_id")) == org_id
+                else default_shop_by_org.get(org_id)
+            )
+            if shop:
+                shop_by_article[str(row["id"])] = shop
+
+        if not shop_by_article:
+            return rows
+
+        stock_res = (
+            self.db.table("organization_shop_article_stocks")
+            .select("shop_id,article_id,stock_quantity,reserved_quantity,alert_quantity,stock_status,active")
+            .in_("shop_id", list({str(shop["id"]) for shop in shop_by_article.values()}))
+            .in_("article_id", list(shop_by_article.keys()))
+            .eq("stock_scope", "sales_item")
+            .execute()
+        )
+        stocks = {
+            (str(row["shop_id"]), str(row["article_id"])): row
+            for row in stock_res.data or []
+        }
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            article_id = str(item["id"])
+            shop = shop_by_article.get(article_id)
+            if shop:
+                stock = stocks.get((str(shop["id"]), article_id))
+                item["shop_id"] = shop["id"]
+                item["shop_name"] = shop.get("name") or ""
+                item["shop_type"] = shop.get("shop_type") or "sales"
+                if stock:
+                    item["stock_quantity"] = stock.get("stock_quantity", 0)
+                    item["reserved_quantity"] = stock.get("reserved_quantity", 0)
+                    item["alert_quantity"] = stock.get("alert_quantity", 0)
+                    item["stock_status"] = stock.get("stock_status", item.get("stock_status"))
+                    item["active"] = stock.get("active", item.get("active", True))
+            out.append(item)
+        return out
+
     def _relevance_score(
         self,
         row: Dict[str, Any],
@@ -172,9 +268,12 @@ class CustomerCatalogService:
         self,
         rows: List[Dict[str, Any]],
         org_map: Optional[Dict[str, Dict[str, Any]]] = None,
+        *,
+        requested_shop_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         if not rows:
             return []
+        rows = self._attach_shop_stock(rows, requested_shop_id=requested_shop_id)
         if org_map is None:
             org_map = self._organization_context(
                 [str(r["organization_id"]) for r in rows if r.get("organization_id")]
@@ -191,6 +290,9 @@ class CustomerCatalogService:
                     "id": r["id"],
                     "organization_id": r["organization_id"],
                     "organization_name": org.get("name") or "",
+                    "shop_id": r.get("shop_id"),
+                    "shop_name": r.get("shop_name"),
+                    "shop_type": r.get("shop_type"),
                     "name": r["name"],
                     "category": r["category"],
                     "unit_sale_price": Decimal(str(r["unit_sale_price"])),
@@ -210,11 +312,13 @@ class CustomerCatalogService:
         categories: Optional[Sequence[str]] = None,
         min_price: Optional[Decimal] = None,
         max_price: Optional[Decimal] = None,
+        shop_id: Optional[str] = None,
     ):
         q = (
             self.db.table("organization_articles")
             .select(self._SELECT_FIELDS, count="exact")
             .eq("active", True)
+            .eq("resource_scope", "sales_item")
         )
         if name_ilike:
             term = name_ilike.strip()
@@ -227,6 +331,19 @@ class CustomerCatalogService:
             q = q.gte("unit_sale_price", float(min_price))
         if max_price is not None:
             q = q.lte("unit_sale_price", float(max_price))
+        if shop_id:
+            stock_res = (
+                self.db.table("organization_shop_article_stocks")
+                .select("article_id")
+                .eq("shop_id", shop_id)
+                .eq("stock_scope", "sales_item")
+                .eq("active", True)
+                .execute()
+            )
+            article_ids = [str(row["article_id"]) for row in stock_res.data or []]
+            if not article_ids:
+                return q.in_("id", ["00000000-0000-0000-0000-000000000000"])
+            q = q.in_("id", article_ids)
         return q
 
     def list_catalog_page(
@@ -239,12 +356,14 @@ class CustomerCatalogService:
         categories: Optional[Sequence[str]] = None,
         min_price: Optional[Decimal] = None,
         max_price: Optional[Decimal] = None,
+        shop_id: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], int]:
         q = self._build_base_query(
             name_ilike=name_ilike,
             categories=categories,
             min_price=min_price,
             max_price=max_price,
+            shop_id=shop_id,
         )
         q = q.order("created_at", desc=True)
         q = q.range(offset, offset + max(limit, 1) - 1)
@@ -252,18 +371,23 @@ class CustomerCatalogService:
         rows = list(res.data or [])
         total = int(res.count) if res.count is not None else len(rows)
         if not customer_id:
-            return self._rows_to_products(rows), total
+            return self._rows_to_products(rows, requested_shop_id=shop_id), total
         sorted_rows, org_map = self._sort_rows_for_customer(
             rows,
             customer_id=customer_id,
             date_field="created_at",
         )
         page = sorted_rows[offset : offset + max(limit, 1)]
-        return self._rows_to_products(page, org_map), total
+        return self._rows_to_products(page, org_map, requested_shop_id=shop_id), total
 
-    def format_catalog_products(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def format_catalog_products(
+        self,
+        rows: List[Dict[str, Any]],
+        *,
+        requested_shop_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """Réutilise l’enrichissement nom d’organisation pour des lignes `organization_articles`."""
-        return self._rows_to_products(rows)
+        return self._rows_to_products(rows, requested_shop_id=requested_shop_id)
 
     def get_public_catalog_product(self, organization_article_id: str) -> Optional[Dict[str, Any]]:
         """Article actif enrichi pour une lecture publique de partage."""
@@ -272,6 +396,7 @@ class CustomerCatalogService:
             .select(self._SELECT_FIELDS)
             .eq("id", organization_article_id)
             .eq("active", True)
+            .eq("resource_scope", "sales_item")
             .limit(1)
             .execute()
         )
@@ -286,6 +411,7 @@ class CustomerCatalogService:
             .select("id")
             .eq("id", organization_article_id)
             .eq("active", True)
+            .eq("resource_scope", "sales_item")
             .limit(1)
             .execute()
         )
@@ -394,6 +520,7 @@ class CustomerCatalogService:
                 self.db.table("organization_articles")
                 .select(self._SELECT_FIELDS)
                 .eq("active", True)
+                .eq("resource_scope", "sales_item")
                 .in_("id", chunk)
             )
             if requested_category:
@@ -450,10 +577,20 @@ class CustomerCatalogService:
             org_map = self._organization_context(
                 [str(r["organization_id"]) for r in rows if r.get("organization_id")]
             )
+        stock_seed: List[Dict[str, Any]] = []
+        for r in rows:
+            if r.get("organization_article_id"):
+                item = dict(r)
+                item["id"] = r["organization_article_id"]
+                stock_seed.append(item)
+        stock_by_article = {
+            str(r["id"]): r for r in self._attach_shop_stock(stock_seed)
+        }
         out: List[Dict[str, Any]] = []
         for r in rows:
             oid = str(r["organization_id"])
             org = org_map.get(oid) or {}
+            stock_context = stock_by_article.get(str(r["organization_article_id"])) or {}
             add_paths = r.get("additional_image_storage_paths") or []
             if not isinstance(add_paths, list):
                 add_paths = []
@@ -461,12 +598,15 @@ class CustomerCatalogService:
                 {
                     "organization_id": r["organization_id"],
                     "organization_name": org.get("name") or "",
+                    "shop_id": stock_context.get("shop_id"),
+                    "shop_name": stock_context.get("shop_name"),
+                    "shop_type": stock_context.get("shop_type"),
                     "organization_article_id": r["organization_article_id"],
                     "name": r["name"],
                     "category": r["category"],
                     "unit_sale_price": Decimal(str(r["unit_sale_price"])),
                     "sale_currency": r.get("sale_currency") or "xof",
-                    "stock_status": r["stock_status"],
+                    "stock_status": stock_context.get("stock_status") or r["stock_status"],
                     "primary_image_storage_path": r["primary_image_storage_path"],
                     "additional_image_storage_paths": add_paths,
                     "description": r.get("description"),

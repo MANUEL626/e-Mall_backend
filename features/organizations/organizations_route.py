@@ -5,7 +5,7 @@ Invitation d’un membre sur une organisation existante (admin / supervisor).
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from features.auth.auth_service import AuthService
@@ -14,6 +14,9 @@ from features.organizations.organizations_models import (
     InviteOrganizationMemberResponse,
     OrganizationMemberItem,
     OrganizationMembersListResponse,
+    OrganizationShopCreateRequest,
+    OrganizationShopItem,
+    OrganizationShopUpdateRequest,
     RegisterMemberOrganizationRequest,
     RegisterMemberOrganizationResponse,
     UpdateOrganizationProfileRequest,
@@ -23,6 +26,7 @@ from features.organizations.organizations_service import (
     OrganizationInviteForbidden,
     OrganizationMemberNotFound,
     OrganizationNotFound,
+    OrganizationShopNotFound,
     OrganizationsService,
 )
 
@@ -129,6 +133,175 @@ def update_organization_profile(
         ) from exc
 
 
+@router.get(
+    "/{organization_id}/shops",
+    response_model=list[OrganizationShopItem],
+)
+def list_organization_shops(
+    organization_id: UUID,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    try:
+        actor_id = _auth.get_user_id_from_access_token(credentials.credentials)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+        ) from exc
+
+    try:
+        rows = _service.list_organization_shops(
+            organization_id=str(organization_id),
+            actor_user_id=actor_id,
+            limit=limit,
+            offset=offset,
+        )
+        return [OrganizationShopItem(**row) for row in rows]
+    except OrganizationNotFound as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Organisation introuvable",
+        ) from exc
+    except OrganizationInviteForbidden as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Acces refuse pour cette organisation",
+        ) from exc
+
+
+@router.post(
+    "/{organization_id}/shops",
+    response_model=OrganizationShopItem,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_organization_shop(
+    organization_id: UUID,
+    body: OrganizationShopCreateRequest,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    try:
+        actor_id = _auth.get_user_id_from_access_token(credentials.credentials)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+        ) from exc
+
+    try:
+        row = _service.create_organization_shop(
+            organization_id=str(organization_id),
+            actor_user_id=actor_id,
+            payload=body.model_dump(mode="json"),
+        )
+        return OrganizationShopItem(**row)
+    except OrganizationNotFound as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Organisation introuvable",
+        ) from exc
+    except OrganizationInviteForbidden as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Acces refuse pour cette organisation",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+
+@router.get(
+    "/{organization_id}/shops/{shop_id}",
+    response_model=OrganizationShopItem,
+)
+def get_organization_shop(
+    organization_id: UUID,
+    shop_id: UUID,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    try:
+        actor_id = _auth.get_user_id_from_access_token(credentials.credentials)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+        ) from exc
+
+    try:
+        row = _service.get_organization_shop(
+            organization_id=str(organization_id),
+            shop_id=str(shop_id),
+            actor_user_id=actor_id,
+        )
+        return OrganizationShopItem(**row)
+    except OrganizationNotFound as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Organisation introuvable",
+        ) from exc
+    except OrganizationShopNotFound as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Boutique introuvable",
+        ) from exc
+    except OrganizationInviteForbidden as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Acces refuse pour cette organisation",
+        ) from exc
+
+
+@router.patch(
+    "/{organization_id}/shops/{shop_id}",
+    response_model=OrganizationShopItem,
+)
+def update_organization_shop(
+    organization_id: UUID,
+    shop_id: UUID,
+    body: OrganizationShopUpdateRequest,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    try:
+        actor_id = _auth.get_user_id_from_access_token(credentials.credentials)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+        ) from exc
+
+    try:
+        row = _service.update_organization_shop(
+            organization_id=str(organization_id),
+            shop_id=str(shop_id),
+            actor_user_id=actor_id,
+            payload=body.model_dump(mode="json", exclude_unset=True),
+        )
+        return OrganizationShopItem(**row)
+    except OrganizationNotFound as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Organisation introuvable",
+        ) from exc
+    except OrganizationShopNotFound as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Boutique introuvable",
+        ) from exc
+    except OrganizationInviteForbidden as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Acces refuse pour cette organisation",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+
 @router.post(
     "/{organization_id}/members/invite",
     response_model=InviteOrganizationMemberResponse,
@@ -163,6 +336,7 @@ async def invite_member_to_existing_organization(
             inviter_user_id=inviter_id,
             email=str(body.email),
             redirect_to=body.redirect_to,
+            shop_ids=[str(shop_id) for shop_id in body.shop_ids],
         )
         return InviteOrganizationMemberResponse(**result)
     except OrganizationNotFound as exc:
@@ -193,6 +367,8 @@ async def invite_member_to_existing_organization(
 )
 def list_organization_members(
     organization_id: UUID,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
     """
@@ -214,6 +390,8 @@ def list_organization_members(
         data = _service.list_organization_members(
             organization_id=str(organization_id),
             actor_user_id=actor_id,
+            limit=limit,
+            offset=offset,
         )
         return OrganizationMembersListResponse(**data)
     except OrganizationNotFound as exc:
@@ -269,6 +447,11 @@ def update_organization_member(
             activity_status=body.activity_status,
             member_type=body.member_type.value if body.member_type is not None else None,
             member_role=body.member_role.value if body.member_role is not None else None,
+            shop_ids=(
+                [str(shop_id) for shop_id in body.shop_ids]
+                if body.shop_ids is not None
+                else None
+            ),
         )
         return OrganizationMemberItem(**row)
     except OrganizationNotFound as exc:

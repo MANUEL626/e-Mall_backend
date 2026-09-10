@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from typing import Any, Dict, List, Optional
 from uuid import UUID
@@ -19,13 +19,23 @@ router = APIRouter(prefix="/api/v1/users", tags=["Users"])
 
 
 @router.get("/", response_model=List[Dict[str, Any]])
-def get_all_users(credentials: HTTPAuthorizationCredentials = Depends(security)):
+def get_all_users(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
     """
     Retourne la liste des profils `public.users`.
     Le filtre est appliqué par les RLS (admins = tout, utilisateurs = soi-même).
     """
     client = get_supabase_client_with_token(credentials.credentials)
-    res = client.table("users").select("*").order("created_at", desc=True).execute()
+    res = (
+        client.table("users")
+        .select("*")
+        .order("created_at", desc=True)
+        .range(offset, offset + limit - 1)
+        .execute()
+    )
     return res.data or []
 
 

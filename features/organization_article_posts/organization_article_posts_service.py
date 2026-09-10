@@ -19,9 +19,20 @@ from features.organization_article_posts.video_processing_service import (
 from features.organization_articles.organization_articles_service import (
     OrganizationArticlesService,
 )
+from features.organization_articles.organization_articles_models import (
+    OrganizationStockScope,
+)
 from features.organization_subscriptions.organization_subscriptions_service import (
     OrganizationSubscriptionFeatureDenied,
     OrganizationSubscriptionService,
+)
+
+_POST_SELECT_COLUMNS = (
+    "id,organization_article_id,slot,media_kind,media_storage_path,"
+    "original_media_storage_path,video_mobile_low_storage_path,"
+    "thumbnail_storage_path,caption,active,processing_status,processing_error,"
+    "media_width,media_height,media_duration_seconds,media_size_bytes,"
+    "created_at,updated_at"
 )
 
 
@@ -52,6 +63,22 @@ class OrganizationArticlePostsService:
         except OrganizationSubscriptionFeatureDenied as exc:
             raise PermissionError(str(exc)) from exc
 
+    def _assert_postable_article(
+        self,
+        user_id: str,
+        organization_id: str,
+        article_id: str,
+    ) -> None:
+        self._articles.assert_article_exists(
+            user_id,
+            organization_id,
+            article_id,
+            allowed_scopes=[
+                OrganizationStockScope.sales_item.value,
+                OrganizationStockScope.rental_asset.value,
+            ],
+        )
+
     @staticmethod
     def _is_schema_cache_missing_column(exc: APIError) -> bool:
         return (
@@ -67,10 +94,10 @@ class OrganizationArticlePostsService:
     ) -> List[Dict[str, Any]]:
         self._articles.assert_org_member(user_id, organization_id)
         self._assert_article_posts_enabled(organization_id)
-        self._articles.get_article(user_id, organization_id, article_id)
+        self._assert_postable_article(user_id, organization_id, article_id)
         res = (
             self.db.table("organization_article_posts")
-            .select("*")
+            .select(_POST_SELECT_COLUMNS)
             .eq("organization_article_id", article_id)
             .order("slot")
             .execute()
@@ -89,12 +116,21 @@ class OrganizationArticlePostsService:
         unique_article_ids = list(dict.fromkeys(str(article_id) for article_id in article_ids))
         if not unique_article_ids:
             return []
+        if len(unique_article_ids) > 100:
+            raise ValueError("Charger au maximum 100 articles par requete batch")
 
         articles_res = (
             self.db.table("organization_articles")
             .select("id")
             .eq("organization_id", organization_id)
             .in_("id", unique_article_ids)
+            .in_(
+                "resource_scope",
+                [
+                    OrganizationStockScope.sales_item.value,
+                    OrganizationStockScope.rental_asset.value,
+                ],
+            )
             .execute()
         )
         found_ids = {str(row["id"]) for row in (articles_res.data or [])}
@@ -104,7 +140,7 @@ class OrganizationArticlePostsService:
 
         res = (
             self.db.table("organization_article_posts")
-            .select("*")
+            .select(_POST_SELECT_COLUMNS)
             .in_("organization_article_id", unique_article_ids)
             .order("organization_article_id")
             .order("slot")
@@ -123,7 +159,7 @@ class OrganizationArticlePostsService:
     ) -> Dict[str, Any]:
         self._articles.assert_org_member(user_id, organization_id)
         self._assert_article_posts_enabled(organization_id)
-        self._articles.get_article(user_id, organization_id, article_id)
+        self._assert_postable_article(user_id, organization_id, article_id)
 
         oid = str(organization_id)
         media_path = body.media_storage_path.strip()
@@ -239,7 +275,7 @@ class OrganizationArticlePostsService:
     ) -> None:
         self._articles.assert_org_member(user_id, organization_id)
         self._assert_article_posts_enabled(organization_id)
-        self._articles.get_article(user_id, organization_id, article_id)
+        self._assert_postable_article(user_id, organization_id, article_id)
         self.db.table("organization_article_posts").delete().eq(
             "organization_article_id", str(article_id)
         ).eq("slot", slot).execute()

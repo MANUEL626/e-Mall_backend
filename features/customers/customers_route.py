@@ -104,13 +104,22 @@ class UpdateCustomerRequest(BaseModel):
 
 
 @router.get("/", response_model=List[Dict[str, Any]])
-def list_players(credentials: HTTPAuthorizationCredentials = Depends(security)):
+def list_players(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
     """
     Liste les entrées de `public.customers`.
     La visibilité est gérée par les RLS.
     """
     client = get_supabase_client_with_token(credentials.credentials)
-    res = client.table("customers").select("*").execute()
+    res = (
+        client.table("customers")
+        .select("*")
+        .range(offset, offset + limit - 1)
+        .execute()
+    )
     return res.data or []
 
 
@@ -251,6 +260,10 @@ def create_customer_article_trend_event(
 
 @router.get("/products", response_model=CustomerCatalogPage)
 def list_customer_catalog_products(
+    shop_id: Optional[UUID] = Query(
+        None,
+        description="Filtrer/enrichir avec le stock d'une boutique sales.",
+    ),
     customer_id: str = Depends(require_customer_id),
     pagination: tuple[int, int] = Depends(_catalog_limit_offset),
 ):
@@ -263,6 +276,7 @@ def list_customer_catalog_products(
         limit=limit,
         offset=offset,
         customer_id=customer_id,
+        shop_id=str(shop_id) if shop_id is not None else None,
     )
     return CustomerCatalogPage(
         items=[CustomerCatalogProduct.model_validate(r) for r in rows],
@@ -313,6 +327,10 @@ def list_customer_trending_products(
 @router.get("/products/search", response_model=CustomerCatalogPage)
 def search_customer_catalog_products(
     q: str = Query(..., min_length=1, description="Sous-chaîne recherchée dans le nom (insensible à la casse)."),
+    shop_id: Optional[UUID] = Query(
+        None,
+        description="Filtrer/enrichir avec le stock d'une boutique sales.",
+    ),
     customer_id: str = Depends(require_customer_id),
     pagination: tuple[int, int] = Depends(_catalog_limit_offset),
 ):
@@ -323,6 +341,7 @@ def search_customer_catalog_products(
         offset=offset,
         customer_id=customer_id,
         name_ilike=q,
+        shop_id=str(shop_id) if shop_id is not None else None,
     )
     return CustomerCatalogPage(
         items=[CustomerCatalogProduct.model_validate(r) for r in rows],
@@ -363,6 +382,10 @@ def filter_customer_catalog_products(
     ),
     min_price: Optional[Decimal] = Query(None, ge=0, description="Prix unitaire minimum."),
     max_price: Optional[Decimal] = Query(None, ge=0, description="Prix unitaire maximum."),
+    shop_id: Optional[UUID] = Query(
+        None,
+        description="Filtrer/enrichir avec le stock d'une boutique sales.",
+    ),
     customer_id: str = Depends(require_customer_id),
     pagination: tuple[int, int] = Depends(_catalog_limit_offset),
 ):
@@ -399,6 +422,7 @@ def filter_customer_catalog_products(
         categories=cats,
         min_price=min_price,
         max_price=max_price,
+        shop_id=str(shop_id) if shop_id is not None else None,
     )
     return CustomerCatalogPage(
         items=[CustomerCatalogProduct.model_validate(r) for r in rows],
@@ -409,9 +433,13 @@ def filter_customer_catalog_products(
 
 
 @router.get("/wishlist", response_model=CustomerWishlistResponse)
-def get_customer_wishlist(customer_id: str = Depends(require_customer_id)):
+def get_customer_wishlist(
+    customer_id: str = Depends(require_customer_id),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
     """Liste des produits en favoris (articles actifs uniquement)."""
-    rows = _wish_cart.list_wishlist(customer_id)
+    rows = _wish_cart.list_wishlist(customer_id, limit=limit, offset=offset)
     return CustomerWishlistResponse(
         items=[CustomerCatalogProduct.model_validate(r) for r in rows],
     )
@@ -442,9 +470,13 @@ def remove_customer_wishlist_item(
 
 
 @router.get("/carts", response_model=CustomerCartsResponse)
-def get_customer_carts(customer_id: str = Depends(require_customer_id)):
+def get_customer_carts(
+    customer_id: str = Depends(require_customer_id),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
     """Paniers regroupés par organisation marchande (une entrée par vendeur)."""
-    raw = _wish_cart.list_carts(customer_id)
+    raw = _wish_cart.list_carts(customer_id, limit=limit, offset=offset)
     carts_out: List[CustomerCartGroup] = []
     for c in raw:
         items_out = [
@@ -460,6 +492,9 @@ def get_customer_carts(customer_id: str = Depends(require_customer_id)):
                 cart_id=c["cart_id"],
                 organization_id=c["organization_id"],
                 organization_name=c["organization_name"],
+                shop_id=c["shop_id"],
+                shop_name=c.get("shop_name", ""),
+                shop_type=c.get("shop_type", "sales"),
                 updated_at=c["updated_at"],
                 items=items_out,
             )
@@ -477,6 +512,7 @@ def add_customer_cart_item(
             customer_id,
             body.organization_article_id,
             body.quantity,
+            body.shop_id,
         )
     except ValueError as exc:
         raise HTTPException(
@@ -559,9 +595,17 @@ def get_customer_organization_summary(
 
 
 @router.get("/subscriptions", response_model=CustomerSubscriptionsListResponse)
-def list_customer_subscriptions(customer_id: str = Depends(require_customer_id)):
+def list_customer_subscriptions(
+    customer_id: str = Depends(require_customer_id),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
     """Abonnements actifs à des marchands (organisations)."""
-    rows = _subscriptions.list_active_for_customer(customer_id)
+    rows = _subscriptions.list_active_for_customer(
+        customer_id,
+        limit=limit,
+        offset=offset,
+    )
     return CustomerSubscriptionsListResponse(
         items=[CustomerSubscriptionItem.model_validate(r) for r in rows],
     )

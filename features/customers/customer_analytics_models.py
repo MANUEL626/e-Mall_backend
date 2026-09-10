@@ -21,6 +21,7 @@ class CustomerTrendEventType(str, Enum):
 
 class CustomerArticleTrendEventCreate(BaseModel):
     organization_id: UUID
+    shop_id: Optional[UUID] = None
     article_id: Optional[UUID] = None
     event_type: CustomerTrendEventType
     search_query: Optional[str] = Field(None, max_length=255)
@@ -64,6 +65,7 @@ class CustomerArticleTrendEventCreate(BaseModel):
 class CustomerArticleTrendEventResponse(BaseModel):
     id: UUID
     organization_id: UUID
+    shop_id: Optional[UUID] = None
     article_id: Optional[UUID] = None
     event_type: str
     deduplicated: bool = False

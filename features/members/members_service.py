@@ -88,11 +88,41 @@ class MembersService:
             for o in ores.data or []:
                 org_by_id[str(o["id"])] = o
 
+        member_ids = [str(m["id"]) for m in member_rows if m.get("id")]
+        shops_by_member: Dict[str, List[Dict[str, Any]]] = {
+            member_id: [] for member_id in member_ids
+        }
+        if member_ids:
+            sres = (
+                self.db.table("organization_shop_members")
+                .select("*, organization_shops(*)")
+                .in_("member_id", member_ids)
+                .eq("activity_status", True)
+                .execute()
+            )
+            for row in sres.data or []:
+                member_id = str(row.get("member_id"))
+                shop = row.get("organization_shops") or {}
+                shops_by_member.setdefault(member_id, []).append(
+                    {
+                        "id": row.get("id"),
+                        "organization_id": row.get("organization_id"),
+                        "member_id": row.get("member_id"),
+                        "shop_id": row.get("shop_id"),
+                        "shop_role": row.get("shop_role"),
+                        "activity_status": row.get("activity_status"),
+                        "created_at": row.get("created_at"),
+                        "updated_at": row.get("updated_at"),
+                        "shop": shop,
+                    }
+                )
+
         memberships: List[Dict[str, Any]] = []
         for m in member_rows:
             oid = m.get("organization_id")
             entry = dict(m)
             entry["organization"] = org_by_id.get(str(oid)) if oid is not None else None
+            entry["shops"] = shops_by_member.get(str(m.get("id")), [])
             memberships.append(entry)
 
         auth_snap = self._public_auth_snapshot(go_true_user) if go_true_user else None

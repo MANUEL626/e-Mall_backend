@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from typing import Any, Dict, List
 
@@ -10,13 +10,17 @@ router = APIRouter(prefix="/api/v1/admins", tags=["Admins"])
 
 
 @router.get("/", response_model=List[Dict[str, Any]])
-def list_admins(credentials: HTTPAuthorizationCredentials = Depends(security)):
+def list_admins(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
     """
     Liste les entrées de `public.admins`.
     RLS: un admin voit tout, un non-admin ne voit que ses propres lignes (souvent aucune).
     """
     client = get_supabase_client_with_token(credentials.credentials)
-    res = client.table("admins").select("*").execute()
+    res = client.table("admins").select("*").range(offset, offset + limit - 1).execute()
     return res.data or []
 
 

@@ -63,6 +63,7 @@ class SaleOrderLineIn(BaseModel):
 
 class CustomerSaleOrderCreate(BaseModel):
     organization_id: UUID
+    shop_id: Optional[UUID] = None
     fulfillment_type: CustomerSaleFulfillment
     lines: List[SaleOrderLineIn] = Field(..., min_length=1)
     delivery_longitude: Optional[float] = None
@@ -71,6 +72,7 @@ class CustomerSaleOrderCreate(BaseModel):
 
 
 class WalkInSaleCreate(BaseModel):
+    shop_id: Optional[UUID] = None
     lines: List[SaleOrderLineIn] = Field(..., min_length=1)
     external_customer_label: Optional[str] = None
     notes: Optional[str] = None
@@ -133,6 +135,7 @@ class SaleOrderLineOut(BaseModel):
 class SaleOrderOut(BaseModel):
     id: UUID
     organization_id: UUID
+    shop_id: UUID
     fulfillment_type: CustomerSaleFulfillment
     customer_id: Optional[UUID] = None
     status: CustomerSaleOrderStatus

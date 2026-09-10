@@ -12,14 +12,16 @@ from features.organization_articles.organization_articles_models import Currency
 
 
 class OrganizationCategory(str, Enum):
-    """Valeurs de `public.organization_type_enum`."""
+    """Type de la boutique par defaut (compat: aussi stocke dans org_type)."""
 
     delivery = "delivery"
+    repair = "repair"
+    rental = "rental"
     sales = "sales"
 
 
 class OrganizationDefaultCurrencies(BaseModel):
-    purchase: CurrencyCode = CurrencyCode.eur
+    purchase: CurrencyCode = CurrencyCode.xof
     sale: CurrencyCode = CurrencyCode.xof
 
 
@@ -74,6 +76,7 @@ class RegisterMemberOrganizationResponse(BaseModel):
     user_id: UUID
     username: str
     organization_id: UUID
+    default_shop_id: Optional[UUID] = None
     organization_profile_picture: Optional[str] = None
     organization_countries: List[str] = Field(default_factory=list)
     organization_default_currencies: OrganizationDefaultCurrencies = Field(
@@ -129,6 +132,11 @@ class InviteOrganizationMemberRequest(BaseModel):
     """Invitation d’un membre par e-mail uniquement (profil complété plus tard)."""
 
     email: EmailStr
+    shop_ids: List[UUID] = Field(
+        ...,
+        min_length=1,
+        description="Boutiques auxquelles affecter le membre invite. Obligatoire en phase multi-boutiques.",
+    )
     redirect_to: Optional[str] = Field(
         None,
         max_length=2000,
@@ -142,6 +150,127 @@ class InviteOrganizationMemberResponse(BaseModel):
     user_id: UUID
     email: str
     organization_id: UUID
+    shop_ids: List[UUID] = Field(default_factory=list)
+
+
+class OrganizationShopType(str, Enum):
+    sales = "sales"
+    delivery = "delivery"
+    repair = "repair"
+    rental = "rental"
+
+
+class OrganizationShopStatus(str, Enum):
+    active = "active"
+    inactive = "inactive"
+    archived = "archived"
+
+
+class OrganizationShopCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=500)
+    shop_type: OrganizationShopType
+    code: Optional[str] = Field(None, max_length=80)
+    description: Optional[str] = Field(None, max_length=10_000)
+    is_default: bool = False
+    country: Optional[str] = Field(None, max_length=2)
+    city: Optional[str] = Field(None, max_length=255)
+    address: Optional[str] = Field(None, max_length=1000)
+    longitude: Optional[float] = Field(None, ge=-180, le=180)
+    latitude: Optional[float] = Field(None, ge=-90, le=90)
+    phone: Optional[str] = Field(None, max_length=50)
+    email: Optional[EmailStr] = None
+    profile_picture: Optional[str] = Field(None, max_length=25_000_000)
+    settings: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("country")
+    @classmethod
+    def validate_country(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        code = value.strip().upper()
+        if not code:
+            return None
+        if len(code) != 2 or not code.isalpha():
+            raise ValueError("country doit etre un code pays ISO alpha-2, ex: TG")
+        return code
+
+
+class OrganizationShopUpdateRequest(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=500)
+    code: Optional[str] = Field(None, max_length=80)
+    description: Optional[str] = Field(None, max_length=10_000)
+    shop_type: Optional[OrganizationShopType] = None
+    status: Optional[OrganizationShopStatus] = None
+    is_default: Optional[bool] = None
+    country: Optional[str] = Field(None, max_length=2)
+    city: Optional[str] = Field(None, max_length=255)
+    address: Optional[str] = Field(None, max_length=1000)
+    longitude: Optional[float] = Field(None, ge=-180, le=180)
+    latitude: Optional[float] = Field(None, ge=-90, le=90)
+    phone: Optional[str] = Field(None, max_length=50)
+    email: Optional[EmailStr] = None
+    profile_picture: Optional[str] = Field(None, max_length=25_000_000)
+    settings: Optional[Dict[str, Any]] = None
+
+    @field_validator("country")
+    @classmethod
+    def validate_country(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        code = value.strip().upper()
+        if not code:
+            return None
+        if len(code) != 2 or not code.isalpha():
+            raise ValueError("country doit etre un code pays ISO alpha-2, ex: TG")
+        return code
+
+    @model_validator(mode="after")
+    def at_least_one_field(self) -> "OrganizationShopUpdateRequest":
+        if all(
+            value is None
+            for value in (
+                self.name,
+                self.code,
+                self.description,
+                self.shop_type,
+                self.status,
+                self.is_default,
+                self.country,
+                self.city,
+                self.address,
+                self.longitude,
+                self.latitude,
+                self.phone,
+                self.email,
+                self.profile_picture,
+                self.settings,
+            )
+        ):
+            raise ValueError("Au moins un champ boutique est requis")
+        return self
+
+
+class OrganizationShopItem(BaseModel):
+    id: UUID
+    organization_id: UUID
+    name: str
+    code: Optional[str] = None
+    description: Optional[str] = None
+    shop_type: OrganizationShopType
+    status: OrganizationShopStatus
+    is_default: bool
+    country: Optional[str] = None
+    city: Optional[str] = None
+    address: Optional[str] = None
+    longitude: Optional[float] = None
+    latitude: Optional[float] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    profile_picture: Optional[str] = None
+    settings: Dict[str, Any] = Field(default_factory=dict)
+    created_by_user_id: Optional[UUID] = None
+    created_at: Any
+    updated_at: Any
 
 
 class MemberType(str, Enum):
@@ -170,6 +299,7 @@ class OrganizationMemberItem(BaseModel):
     activity_status: bool
     created_at: Any
     user: Dict[str, Any]
+    shops: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class OrganizationMembersListResponse(BaseModel):
@@ -182,6 +312,10 @@ class UpdateOrganizationMemberRequest(BaseModel):
     activity_status: Optional[bool] = None
     member_type: Optional[MemberType] = None
     member_role: Optional[MemberRole] = None
+    shop_ids: Optional[List[UUID]] = Field(
+        None,
+        description="Remplace les boutiques affectees a ce membre. Liste vide = retirer les affectations boutique.",
+    )
 
     @model_validator(mode="after")
     def at_least_one_field(self) -> "UpdateOrganizationMemberRequest":
@@ -189,8 +323,9 @@ class UpdateOrganizationMemberRequest(BaseModel):
             self.activity_status is None
             and self.member_type is None
             and self.member_role is None
+            and self.shop_ids is None
         ):
             raise ValueError(
-                "Au moins un parmi activity_status, member_type, member_role est requis"
+                "Au moins un parmi activity_status, member_type, member_role, shop_ids est requis"
             )
         return self

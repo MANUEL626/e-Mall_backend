@@ -26,6 +26,7 @@ class ArticleOrderLineCreate(BaseModel):
 
 
 class ArticleOrderCreate(BaseModel):
+    shop_id: Optional[UUID] = None
     note: Optional[str] = Field(None, max_length=2000)
     currency: Optional[CurrencyCode] = None
     lines: List[ArticleOrderLineCreate] = Field(..., min_length=1)
@@ -65,8 +66,9 @@ class ArticleOrderResponse(BaseModel):
 
     id: UUID
     organization_id: UUID
+    shop_id: UUID
     status: ArticleOrderStatus
-    currency: CurrencyCode = CurrencyCode.eur
+    currency: CurrencyCode = CurrencyCode.xof
     total_amount: Decimal = Decimal("0")
     note: Optional[str] = None
     created_at: datetime

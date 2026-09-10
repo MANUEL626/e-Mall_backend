@@ -42,13 +42,21 @@ class CustomerSubscriptionsService:
             "subscriber_count": n,
         }
 
-    def list_active_for_customer(self, customer_id: str) -> List[Dict[str, Any]]:
+    def list_active_for_customer(
+        self,
+        customer_id: str,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        page_limit = max(1, min(int(limit or 50), 200))
+        page_offset = max(0, int(offset or 0))
         sub_res = (
             self.db.table("customer_organization_subscriptions")
             .select("id, organization_id, status, subscribed_at, cancelled_at")
             .eq("customer_id", customer_id)
             .eq("status", "active")
             .order("subscribed_at", desc=True)
+            .range(page_offset, page_offset + page_limit - 1)
             .execute()
         )
         subs = list(sub_res.data or [])

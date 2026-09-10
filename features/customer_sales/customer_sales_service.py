@@ -57,6 +57,16 @@ _STATUSES_FOR_GROUP: Dict[StatusGroup, List[str]] = {
     StatusGroup.completed: ["completed"],
 }
 
+_ORDER_SELECT_COLUMNS = (
+    "id,organization_id,shop_id,fulfillment_type,customer_id,status,"
+    "assigned_delivery_member_id,delivery_longitude,delivery_latitude,"
+    "currency,notes,external_customer_label,created_at,updated_at"
+)
+
+_ORDER_LINE_SELECT_COLUMNS = (
+    "id,order_id,article_id,quantity,unit_price_snapshot,currency_snapshot"
+)
+
 
 class CustomerSalesService:
     def __init__(self) -> None:
@@ -130,6 +140,25 @@ class CustomerSalesService:
         if status_group is None:
             return None
         return _STATUSES_FOR_GROUP.get(status_group)
+
+    @staticmethod
+    def _rpc_missing(exc: APIError) -> bool:
+        return getattr(exc, "code", None) in {"PGRST202", "PGRST204", "PGRST205"}
+
+    @staticmethod
+    def _normalize_rpc_order_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            lines = item.get("organization_customer_sale_order_lines") or []
+            if not isinstance(lines, list):
+                lines = []
+            item["organization_customer_sale_order_lines"] = lines
+            item["subtotal_amount"] = Decimal(str(item.get("subtotal_amount") or "0"))
+            item["total_items"] = int(item.get("total_items") or 0)
+            item["total_lines"] = int(item.get("total_lines") or len(lines))
+            out.append(item)
+        return out
 
     # --- customer_params ---
 
@@ -244,7 +273,10 @@ class CustomerSalesService:
     # --- vente client ---
 
     def _fetch_articles_for_order(
-        self, organization_id: str, article_ids: List[str]
+        self,
+        organization_id: str,
+        article_ids: List[str],
+        shop_id: Optional[str] = None,
     ) -> Dict[str, Dict[str, Any]]:
         res = (
             self.db.table("organization_articles")
@@ -252,6 +284,7 @@ class CustomerSalesService:
                 "id,organization_id,name,unit_sale_price,sale_currency,stock_quantity,reserved_quantity,active"
             )
             .eq("organization_id", organization_id)
+            .eq("resource_scope", "sales_item")
             .in_("id", article_ids)
             .execute()
         )
@@ -263,25 +296,42 @@ class CustomerSalesService:
         for aid, r in by_id.items():
             if not r.get("active"):
                 raise ValueError(f"Article inactif : {aid}")
+        if shop_id is not None:
+            sres = (
+                self.db.table("organization_shop_article_stocks")
+                .select("article_id,stock_quantity,reserved_quantity,active")
+                .eq("organization_id", organization_id)
+                .eq("shop_id", shop_id)
+                .in_("article_id", article_ids)
+                .execute()
+            )
+            stocks = {str(row["article_id"]): row for row in sres.data or []}
+            missing_stock = set(article_ids) - set(stocks.keys())
+            if missing_stock:
+                raise ValueError("Articles introuvables dans le stock de cette boutique")
+            for aid, stock in stocks.items():
+                if stock.get("active") is not True:
+                    raise ValueError(f"Article inactif dans cette boutique : {aid}")
+                by_id[aid]["stock_quantity"] = stock.get("stock_quantity", 0)
+                by_id[aid]["reserved_quantity"] = stock.get("reserved_quantity", 0)
         return by_id
 
-    def _organization_default_sale_currency(self, organization_id: str) -> str:
+    def _assert_sales_shop(self, organization_id: str, shop_id: str) -> None:
         res = (
-            self.db.table("organizations")
-            .select("default_currencies")
-            .eq("id", organization_id)
+            self.db.table("organization_shops")
+            .select("id")
+            .eq("id", shop_id)
+            .eq("organization_id", organization_id)
+            .eq("shop_type", "sales")
+            .neq("status", "archived")
             .limit(1)
             .execute()
         )
-        rows = res.data or []
-        defaults = rows[0].get("default_currencies") if rows else None
-        sale = (
-            str(defaults.get("sale") or CurrencyCode.xof.value).strip().lower()
-            if isinstance(defaults, dict)
-            else CurrencyCode.xof.value
-        )
-        allowed = {c.value for c in CurrencyCode}
-        return sale if sale in allowed else CurrencyCode.xof.value
+        if not (res.data or []):
+            raise ValueError("Boutique de vente introuvable pour cette organisation")
+
+    def _organization_default_sale_currency(self, organization_id: str) -> str:
+        return CurrencyCode.xof.value
 
     def _org_has_active_delivery_member(self, organization_id: str) -> bool:
         """
@@ -321,6 +371,10 @@ class CustomerSalesService:
             raise ValueError("Utiliser l'endpoint marchand walk-in pour ce type")
 
         oid = str(body.organization_id)
+        if body.shop_id is None:
+            raise ValueError("shop_id est requis pour creer une commande client")
+        shop_id = str(body.shop_id)
+        self._assert_sales_shop(oid, shop_id)
         if body.fulfillment_type in (
             CustomerSaleFulfillment.pickup,
             CustomerSaleFulfillment.delivery,
@@ -350,21 +404,15 @@ class CustomerSalesService:
                 )
 
         article_ids = [str(l.article_id) for l in body.lines]
-        arts = self._fetch_articles_for_order(oid, article_ids)
-        default_currency = self._organization_default_sale_currency(oid)
-        line_currencies = {
-            str(arts[str(line.article_id)].get("sale_currency") or default_currency).lower()
-            for line in body.lines
-        }
-        if len(line_currencies) > 1:
-            raise ValueError("Une commande ne peut pas melanger plusieurs devises")
-        order_currency = next(iter(line_currencies), default_currency)
+        arts = self._fetch_articles_for_order(oid, article_ids, shop_id=shop_id)
+        order_currency = CurrencyCode.xof.value
 
         oins = (
             self.db.table("organization_customer_sale_orders")
             .insert(
                 {
                     "organization_id": oid,
+                    "shop_id": shop_id,
                     "fulfillment_type": body.fulfillment_type.value,
                     "customer_id": cid,
                     "status": CustomerSaleOrderStatus.pending.value,
@@ -385,22 +433,32 @@ class CustomerSalesService:
         for ln in body.lines:
             aid = str(ln.article_id)
             price = arts[aid]["unit_sale_price"]
-            currency = str(arts[aid].get("sale_currency") or order_currency).lower()
             line_rows.append(
                 {
                     "order_id": order_id,
                     "article_id": aid,
                     "quantity": ln.quantity,
                     "unit_price_snapshot": float(price),
-                    "currency_snapshot": currency,
+                    "currency_snapshot": CurrencyCode.xof.value,
                 }
             )
 
-        lins = (
-            self.db.table("organization_customer_sale_order_lines")
-            .insert(line_rows)
-            .execute()
-        )
+        try:
+            lins = (
+                self.db.table("organization_customer_sale_order_lines")
+                .insert(line_rows)
+                .execute()
+            )
+        except APIError as exc:
+            msg = (
+                str(exc.message)
+                if getattr(exc, "message", None)
+                else "Commande refusée"
+            )
+            self.db.table("organization_customer_sale_orders").delete().eq(
+                "id", order_id
+            ).execute()
+            raise ValueError(msg) from exc
         if not (lins.data or []) and line_rows:
             self.db.table("organization_customer_sale_orders").delete().eq(
                 "id", order_id
@@ -439,7 +497,7 @@ class CustomerSalesService:
     def _select_order_with_lines(self, order_id: str) -> Dict[str, Any]:
         res = (
             self.db.table("organization_customer_sale_orders")
-            .select("*")
+            .select(_ORDER_SELECT_COLUMNS)
             .eq("id", order_id)
             .limit(1)
             .execute()
@@ -450,7 +508,7 @@ class CustomerSalesService:
         row = dict(rows[0])
         lres = (
             self.db.table("organization_customer_sale_order_lines")
-            .select("*")
+            .select(_ORDER_LINE_SELECT_COLUMNS)
             .eq("order_id", order_id)
             .execute()
         )
@@ -486,7 +544,7 @@ class CustomerSalesService:
 
         lres = (
             self.db.table("organization_customer_sale_order_lines")
-            .select("*")
+            .select(_ORDER_LINE_SELECT_COLUMNS)
             .in_("order_id", order_ids)
             .execute()
         )
@@ -665,11 +723,7 @@ class CustomerSalesService:
                     "article_name": line.get("article_name"),
                     "quantity": qty,
                     "unit_price": str(unit_price),
-                    "currency": str(
-                        line.get("currency_snapshot")
-                        or order_row.get("currency")
-                        or CurrencyCode.xof.value
-                    ).lower(),
+                    "currency": CurrencyCode.xof.value,
                     "line_total": str(line_total),
                 }
             )
@@ -680,7 +734,7 @@ class CustomerSalesService:
             "organization_id": org_id,
             "customer_id": str(customer_id) if customer_id else None,
             "receipt_number": self._receipt_number(order_row),
-            "currency": str(order_row.get("currency") or CurrencyCode.xof.value).lower(),
+            "currency": CurrencyCode.xof.value,
             "subtotal_amount": float(subtotal),
             "total_amount": float(subtotal),
             "total_items": int(order_row.get("total_items") or 0),
@@ -731,20 +785,39 @@ class CustomerSalesService:
         self,
         user_id: str,
         status_group: Optional[StatusGroup] = None,
+        limit: int = 50,
+        offset: int = 0,
     ) -> List[Dict[str, Any]]:
         cid = self.get_customer_id_for_user(user_id)
         if not cid:
             raise LookupError("Profil client introuvable")
+        safe_limit = max(1, min(int(limit), 200))
+        safe_offset = max(0, int(offset))
+        statuses = self._status_filter(status_group)
+        try:
+            res = self.db.rpc(
+                "list_customer_sales_with_lines",
+                {
+                    "p_customer_id": cid,
+                    "p_statuses": statuses,
+                    "p_limit": safe_limit,
+                    "p_offset": safe_offset,
+                },
+            ).execute()
+            return self._normalize_rpc_order_rows(list(res.data or []))
+        except APIError as exc:
+            if not self._rpc_missing(exc):
+                raise
+
         q = (
             self.db.table("organization_customer_sale_orders")
-            .select("*")
+            .select(_ORDER_SELECT_COLUMNS)
             .eq("customer_id", cid)
             .order("created_at", desc=True)
         )
-        statuses = self._status_filter(status_group)
         if statuses is not None:
             q = q.in_("status", list(statuses))
-        res = q.execute()
+        res = q.range(safe_offset, safe_offset + safe_limit - 1).execute()
         rows = res.data or []
         return self._attach_lines_to_orders(list(rows))
 
@@ -816,18 +889,44 @@ class CustomerSalesService:
         user_id: str,
         organization_id: str,
         status_group: Optional[StatusGroup] = None,
+        shop_id: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
     ) -> List[Dict[str, Any]]:
         self.assert_org_member(user_id, organization_id)
+        if shop_id is not None:
+            self._assert_sales_shop(organization_id, shop_id)
+        safe_limit = max(1, min(int(limit), 200))
+        safe_offset = max(0, int(offset))
+        statuses = self._status_filter(status_group)
+        try:
+            res = self.db.rpc(
+                "list_org_customer_sales_with_lines",
+                {
+                    "p_user_id": user_id,
+                    "p_organization_id": organization_id,
+                    "p_shop_id": shop_id,
+                    "p_statuses": statuses,
+                    "p_limit": safe_limit,
+                    "p_offset": safe_offset,
+                },
+            ).execute()
+            return self._normalize_rpc_order_rows(list(res.data or []))
+        except APIError as exc:
+            if not self._rpc_missing(exc):
+                raise
+
         q = (
             self.db.table("organization_customer_sale_orders")
-            .select("*")
+            .select(_ORDER_SELECT_COLUMNS)
             .eq("organization_id", organization_id)
             .order("created_at", desc=True)
         )
-        statuses = self._status_filter(status_group)
         if statuses is not None:
             q = q.in_("status", list(statuses))
-        res = q.execute()
+        if shop_id is not None:
+            q = q.eq("shop_id", shop_id)
+        res = q.range(safe_offset, safe_offset + safe_limit - 1).execute()
         rows = res.data or []
         return self._attach_lines_to_orders(list(rows))
 
@@ -866,16 +965,17 @@ class CustomerSalesService:
         except OrganizationSubscriptionLimitExceeded as exc:
             raise ValueError(str(exc)) from exc
 
+        if body.shop_id is None:
+            raise ValueError("shop_id est requis pour creer une vente comptoir")
+        shop_id = str(body.shop_id)
+        self._assert_sales_shop(organization_id, shop_id)
         article_ids = [str(l.article_id) for l in body.lines]
-        arts = self._fetch_articles_for_order(organization_id, article_ids)
-        default_currency = self._organization_default_sale_currency(organization_id)
-        line_currencies = {
-            str(arts[str(line.article_id)].get("sale_currency") or default_currency).lower()
-            for line in body.lines
-        }
-        if len(line_currencies) > 1:
-            raise ValueError("Une vente magasin ne peut pas melanger plusieurs devises")
-        order_currency = next(iter(line_currencies), default_currency)
+        arts = self._fetch_articles_for_order(
+            organization_id,
+            article_ids,
+            shop_id=shop_id,
+        )
+        order_currency = CurrencyCode.xof.value
         for ln in body.lines:
             aid = str(ln.article_id)
             art = arts[aid]
@@ -894,6 +994,7 @@ class CustomerSalesService:
             .insert(
                 {
                     "organization_id": organization_id,
+                    "shop_id": shop_id,
                     "fulfillment_type": CustomerSaleFulfillment.walk_in_offline.value,
                     "customer_id": None,
                     "status": CustomerSaleOrderStatus.completed.value,
@@ -915,14 +1016,13 @@ class CustomerSalesService:
         for ln in body.lines:
             aid = str(ln.article_id)
             price = arts[aid]["unit_sale_price"]
-            currency = str(arts[aid].get("sale_currency") or order_currency).lower()
             line_rows.append(
                 {
                     "order_id": order_id,
                     "article_id": aid,
                     "quantity": ln.quantity,
                     "unit_price_snapshot": float(price),
-                    "currency_snapshot": currency,
+                    "currency_snapshot": CurrencyCode.xof.value,
                 }
             )
 
@@ -1191,9 +1291,10 @@ class CustomerSalesService:
         mids = [str(m["id"]) for m in member_rows]
         res = (
             self.db.table("organization_customer_sale_orders")
-            .select("*")
+            .select(_ORDER_SELECT_COLUMNS)
             .in_("assigned_delivery_member_id", mids)
             .order("created_at", desc=True)
+            .limit(100)
             .execute()
         )
         rows = res.data or []

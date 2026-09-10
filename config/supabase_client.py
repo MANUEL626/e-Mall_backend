@@ -7,6 +7,8 @@ import os
 import sys
 from typing import Optional
 
+import httpx
+
 from dotenv import load_dotenv
 from supabase import Client, ClientOptions, create_client
 
@@ -26,7 +28,7 @@ def _postgrest_use_http2() -> bool:
         return True
     if raw in ("0", "false", "no"):
         return False
-    return sys.platform != "win32"
+    return False
 
 
 def _patch_postgrest_httpx_http2() -> None:
@@ -179,4 +181,18 @@ supabase: Client = get_supabase_client(use_service_key=False)
 # Instance globale du client avec SERVICE_KEY (bypass RLS)
 # ⚠️ À utiliser uniquement pour les opérations administratives côté serveur
 supabase_admin: Client = get_supabase_client(use_service_key=True)
+
+
+def is_supabase_transport_error(exc: BaseException) -> bool:
+    """True pour les erreurs reseau/protocole PostgREST a retourner en 503."""
+    if isinstance(exc, httpx.HTTPError):
+        return True
+    message = str(exc).lower()
+    return (
+        "deque mutated during iteration" in message
+        or "connectionterminated" in message
+        or "remoteprotocolerror" in message
+        or "server disconnected" in message
+        or "localprotocolerror" in message
+    )
 

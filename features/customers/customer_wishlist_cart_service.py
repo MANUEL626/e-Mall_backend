@@ -14,6 +14,7 @@ from features.customers.customer_catalog_service import CustomerCatalogService
 class CustomerWishlistCartService:
     _ARTICLE_FIELDS = (
         "id, organization_id, name, category, unit_sale_price, sale_currency, stock_status, "
+        "stock_quantity, reserved_quantity, alert_quantity, "
         "primary_image_storage_path, additional_image_storage_paths, description, active"
     )
 
@@ -32,24 +33,105 @@ class CustomerWishlistCartService:
         rows = res.data or []
         return str(rows[0]["id"]) if rows else None
 
-    def _get_active_article(self, organization_article_id: UUID) -> Optional[Dict[str, Any]]:
+    def _default_sales_shop_id(self, organization_id: str) -> str:
+        res = (
+            self.db.table("organization_shops")
+            .select("id")
+            .eq("organization_id", organization_id)
+            .eq("shop_type", "sales")
+            .neq("status", "archived")
+            .order("is_default", desc=True)
+            .order("created_at")
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            raise ValueError("Aucune boutique de vente active pour cette organisation")
+        return str(rows[0]["id"])
+
+    def _assert_sales_shop(self, organization_id: str, shop_id: str) -> Dict[str, Any]:
+        res = (
+            self.db.table("organization_shops")
+            .select("id, organization_id, name, shop_type")
+            .eq("id", shop_id)
+            .eq("organization_id", organization_id)
+            .eq("shop_type", "sales")
+            .neq("status", "archived")
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            raise ValueError("Boutique de vente introuvable pour cette organisation")
+        return rows[0]
+
+    def _shop_names(self, shop_ids: List[str]) -> Dict[str, Dict[str, str]]:
+        if not shop_ids:
+            return {}
+        res = (
+            self.db.table("organization_shops")
+            .select("id, name, shop_type")
+            .in_("id", list(set(shop_ids)))
+            .execute()
+        )
+        return {
+            str(row["id"]): {
+                "name": row.get("name") or "",
+                "shop_type": row.get("shop_type") or "sales",
+            }
+            for row in res.data or []
+        }
+
+    def _get_active_article(
+        self,
+        organization_article_id: UUID,
+        shop_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         res = (
             self.db.table("organization_articles")
             .select(self._ARTICLE_FIELDS)
             .eq("id", str(organization_article_id))
             .eq("active", True)
+            .eq("resource_scope", "sales_item")
             .limit(1)
             .execute()
         )
         rows = res.data or []
-        return rows[0] if rows else None
+        if not rows:
+            return None
+        article = rows[0]
+        sid = shop_id or self._default_sales_shop_id(str(article["organization_id"]))
+        self._assert_sales_shop(str(article["organization_id"]), sid)
+        stock = (
+            self.db.table("organization_shop_article_stocks")
+            .select("shop_id,stock_quantity,reserved_quantity,alert_quantity,stock_status,active")
+            .eq("shop_id", sid)
+            .eq("article_id", str(organization_article_id))
+            .eq("stock_scope", "sales_item")
+            .limit(1)
+            .execute()
+        )
+        stock_rows = stock.data or []
+        if not stock_rows or stock_rows[0].get("active") is not True:
+            return None
+        article.update(stock_rows[0])
+        return article
 
-    def list_wishlist(self, customer_id: str) -> List[Dict[str, Any]]:
+    def list_wishlist(
+        self,
+        customer_id: str,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        page_limit = max(1, min(int(limit or 50), 200))
+        page_offset = max(0, int(offset or 0))
         res = (
             self.db.table("customer_wishlist_items")
             .select("organization_article_id")
             .eq("customer_id", customer_id)
             .order("created_at", desc=True)
+            .range(page_offset, page_offset + page_limit - 1)
             .execute()
         )
         ids = [r["organization_article_id"] for r in (res.data or [])]
@@ -60,6 +142,7 @@ class CustomerWishlistCartService:
             .select(self._ARTICLE_FIELDS)
             .in_("id", ids)
             .eq("active", True)
+            .eq("resource_scope", "sales_item")
             .execute()
         )
         rows = list(art.data or [])
@@ -100,12 +183,13 @@ class CustomerWishlistCartService:
         )
         return bool(res.data)
 
-    def _get_or_create_cart(self, customer_id: str, organization_id: str) -> str:
+    def _get_or_create_cart(self, customer_id: str, organization_id: str, shop_id: str) -> str:
         existing = (
             self.db.table("customer_carts")
             .select("id")
             .eq("customer_id", customer_id)
             .eq("organization_id", organization_id)
+            .eq("shop_id", shop_id)
             .limit(1)
             .execute()
         )
@@ -118,6 +202,7 @@ class CustomerWishlistCartService:
                 {
                     "customer_id": customer_id,
                     "organization_id": organization_id,
+                    "shop_id": shop_id,
                 }
             )
             .execute()
@@ -128,16 +213,26 @@ class CustomerWishlistCartService:
         return str(data[0]["id"])
 
     def add_cart_item(
-        self, customer_id: str, organization_article_id: UUID, quantity: int
+        self,
+        customer_id: str,
+        organization_article_id: UUID,
+        quantity: int,
+        shop_id: Optional[UUID] = None,
     ) -> Tuple[str, str]:
         """
         Retourne (cart_id, line_id) après ajout ou fusion de quantité.
         """
-        article = self._get_active_article(organization_article_id)
+        if shop_id is None:
+            raise ValueError("shop_id est requis pour ajouter un article au panier")
+        article = self._get_active_article(
+            organization_article_id,
+            shop_id=str(shop_id),
+        )
         if not article:
             raise ValueError("Article introuvable ou indisponible")
         org_id = str(article["organization_id"])
-        cart_id = self._get_or_create_cart(customer_id, org_id)
+        sid = str(article["shop_id"])
+        cart_id = self._get_or_create_cart(customer_id, org_id, sid)
 
         line = (
             self.db.table("customer_cart_items")
@@ -255,12 +350,20 @@ class CustomerWishlistCartService:
         self.db.table("customer_carts").delete().eq("id", str(cart_id)).execute()
         return True
 
-    def list_carts(self, customer_id: str) -> List[Dict[str, Any]]:
+    def list_carts(
+        self,
+        customer_id: str,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        page_limit = max(1, min(int(limit or 50), 200))
+        page_offset = max(0, int(offset or 0))
         carts_res = (
             self.db.table("customer_carts")
-            .select("id, organization_id, updated_at")
+            .select("id, organization_id, shop_id, updated_at")
             .eq("customer_id", customer_id)
             .order("updated_at", desc=True)
+            .range(page_offset, page_offset + page_limit - 1)
             .execute()
         )
         carts = list(carts_res.data or [])
@@ -281,16 +384,17 @@ class CustomerWishlistCartService:
                 self.db.table("organization_articles")
                 .select(self._ARTICLE_FIELDS)
                 .in_("id", article_ids)
+                .eq("resource_scope", "sales_item")
                 .execute()
             )
             article_rows = list(art_res.data or [])
         else:
             article_rows = []
-        products = self._catalog.format_catalog_products(article_rows)
-        prod_by_id = {str(p["id"]): p for p in products}
+        article_by_id = {str(row["id"]): row for row in article_rows}
 
         org_ids = list({str(c["organization_id"]) for c in carts})
         org_names = self._org_names(org_ids)
+        shop_info = self._shop_names([str(c["shop_id"]) for c in carts if c.get("shop_id")])
 
         lines_by_cart: Dict[str, List[Dict[str, Any]]] = {cid: [] for cid in cart_ids}
         for ln in lines:
@@ -302,10 +406,20 @@ class CustomerWishlistCartService:
         for c in carts:
             cid = str(c["id"])
             oid = str(c["organization_id"])
+            sid = str(c["shop_id"])
             item_payloads: List[Dict[str, Any]] = []
             for ln in lines_by_cart.get(cid, []):
                 aid = str(ln["organization_article_id"])
-                p = prod_by_id.get(aid)
+                article = article_by_id.get(aid)
+                products = (
+                    self._catalog.format_catalog_products(
+                        [article],
+                        requested_shop_id=sid,
+                    )
+                    if article
+                    else []
+                )
+                p = products[0] if products else None
                 if not p:
                     continue
                 item_payloads.append(
@@ -320,6 +434,9 @@ class CustomerWishlistCartService:
                     "cart_id": c["id"],
                     "organization_id": c["organization_id"],
                     "organization_name": org_names.get(oid, ""),
+                    "shop_id": c["shop_id"],
+                    "shop_name": shop_info.get(sid, {}).get("name", ""),
+                    "shop_type": shop_info.get(sid, {}).get("shop_type", "sales"),
                     "updated_at": c["updated_at"],
                     "items": item_payloads,
                 }

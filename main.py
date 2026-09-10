@@ -1,6 +1,9 @@
+import os
 from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -14,12 +17,16 @@ from features.customer_sales.customer_sales_route import (
     customer_router as customer_sales_customer_router,
     delivery_router as customer_sales_delivery_router,
     org_router as customer_sales_org_router,
+    shop_org_router as customer_sales_shop_org_router,
 )
 from features.organization_article_orders.article_orders_route import (
     router as organization_article_orders_router,
+    shop_router as organization_shop_article_orders_router,
 )
 from features.organization_articles.organization_articles_route import (
     router as organization_articles_router,
+    shop_articles_router,
+    shop_stock_resources_router,
 )
 from features.share.share_route import router as share_router
 from features.members.members_route import router as members_router
@@ -30,6 +37,16 @@ from features.organization_subscriptions.organization_subscriptions_route import
 )
 from features.performance.performance_route import router as performance_router
 from features.users.users_route import router as users_router
+from features.organization_repairs.organization_repairs_route import (
+    router as organization_repairs_router,
+)
+from features.organization_rentals.organization_rentals_route import (
+    router as organization_rentals_router,
+)
+from features.delivery_realtime.delivery_realtime_route import (
+    router as delivery_realtime_router,
+)
+from infra.redis_client import init_redis, close_redis
 
 
 app = FastAPI(
@@ -88,6 +105,30 @@ app = FastAPI(
     ]
 )
 
+
+# Événements application: initialisation et fermeture de Redis (désactivables en DEV)
+USE_REDIS = os.getenv("APP_ENV", "dev").strip().lower() == "prod"
+
+if USE_REDIS:
+    @app.on_event("startup")
+    async def _on_startup() -> None:
+        await init_redis(app)
+
+    @app.on_event("shutdown")
+    async def _on_shutdown() -> None:
+        await close_redis(app)
+else:
+    @app.on_event("startup")
+    async def _on_startup() -> None:
+        # Redis désactivé en DEV
+        return None
+
+    @app.on_event("shutdown")
+    async def _on_shutdown() -> None:
+        # Redis désactivé en DEV
+        return None
+
+
 # Configuration CORS
 # Autoriser les requêtes depuis les applications Angular (local et production)
 origins = [
@@ -118,6 +159,82 @@ async def messaging_schema_missing_handler(
     )
 
 
+@app.exception_handler(RequestValidationError)
+async def request_validation_handler(
+    request: Request,
+    exc: RequestValidationError,
+) -> JSONResponse:
+    def field_path(location: tuple[object, ...]) -> str:
+        parts = [part for part in location if part not in ("body", "query", "path")]
+        if not parts:
+            return "requete"
+        result = ""
+        for part in parts:
+            if isinstance(part, int):
+                result += f"[{part}]"
+            else:
+                result += f".{part}" if result else str(part)
+        return result
+
+    def clear_message(error: dict) -> str:
+        error_type = str(error.get("type") or "")
+        context = error.get("ctx") or {}
+        messages = {
+            "missing": "Ce champ est obligatoire.",
+            "uuid_parsing": "La valeur doit etre un UUID valide.",
+            "uuid_type": "La valeur doit etre un UUID valide.",
+            "datetime_parsing": "La valeur doit etre une date ISO 8601 valide.",
+            "datetime_from_date_parsing": "La valeur doit etre une date ISO 8601 valide.",
+            "decimal_parsing": "La valeur doit etre un nombre valide.",
+            "decimal_type": "La valeur doit etre un nombre valide.",
+            "int_parsing": "La valeur doit etre un entier valide.",
+            "int_type": "La valeur doit etre un entier valide.",
+            "list_type": "La valeur doit etre une liste.",
+            "enum": "La valeur ne fait pas partie des choix autorises.",
+        }
+        if error_type == "greater_than_equal":
+            return f"La valeur doit etre superieure ou egale a {context.get('ge')}."
+        if error_type == "less_than_equal":
+            return f"La valeur doit etre inferieure ou egale a {context.get('le')}."
+        if error_type in {"too_short", "list_too_short"}:
+            minimum = context.get("min_length")
+            return f"La liste doit contenir au moins {minimum or 1} element(s)."
+        if error_type in {"string_too_long", "too_long"}:
+            maximum = context.get("max_length")
+            return f"La valeur depasse la longueur maximale autorisee ({maximum})."
+        if error_type == "value_error":
+            message = str(error.get("msg") or "Valeur invalide.")
+            return message.removeprefix("Value error, ")
+        return messages.get(error_type, str(error.get("msg") or "Valeur invalide."))
+
+    errors = []
+    for raw_error in exc.errors():
+        error = dict(raw_error)
+        error["field"] = field_path(tuple(error.get("loc") or ()))
+        error["message"] = clear_message(error)
+        errors.append(error)
+
+    if len(errors) == 1:
+        summary = f"{errors[0]['field']}: {errors[0]['message']}"
+    else:
+        summary = (
+            f"La requete contient {len(errors)} erreurs de validation. "
+            "Consultez detail.errors pour les corriger."
+        )
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": {
+                "code": "validation_error",
+                "message": summary,
+                "method": request.method,
+                "path": request.url.path,
+                "errors": jsonable_encoder(errors),
+            }
+        },
+    )
+
+
 # Inclusion des routes
 app.include_router(share_router)
 app.include_router(auth_router)
@@ -129,9 +246,16 @@ app.include_router(organization_subscriptions_router)
 app.include_router(stripe_router)
 app.include_router(members_router)
 app.include_router(organization_articles_router)
+app.include_router(shop_articles_router)
+app.include_router(shop_stock_resources_router)
 app.include_router(organization_article_orders_router)
+app.include_router(organization_shop_article_orders_router)
 app.include_router(performance_router)
 app.include_router(messaging_router)
 app.include_router(customer_sales_delivery_router)
 app.include_router(customer_sales_customer_router)
 app.include_router(customer_sales_org_router)
+app.include_router(customer_sales_shop_org_router)
+app.include_router(organization_repairs_router)
+app.include_router(organization_rentals_router)
+app.include_router(delivery_realtime_router)

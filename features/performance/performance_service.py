@@ -9,10 +9,10 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, Iterable, List, Tuple
 from zoneinfo import ZoneInfo
 
+from postgrest.exceptions import APIError
 from supabase import Client
 
 from config.supabase_client import supabase_admin
-from features.organization_articles.organization_articles_models import CurrencyCode
 from features.organization_subscriptions.organization_subscriptions_service import (
     OrganizationSubscriptionFeatureDenied,
     OrganizationSubscriptionService,
@@ -61,6 +61,11 @@ class PerformanceService:
             self.subscriptions.assert_feature_enabled(organization_id, feature)
         except OrganizationSubscriptionFeatureDenied as exc:
             raise PermissionError(str(exc)) from exc
+
+    @staticmethod
+    def _rpc_missing(exc: APIError) -> bool:
+        code = getattr(exc, "code", None)
+        return code in {"PGRST202", "PGRST204", "PGRST205"}
 
     def get_monthly_summary(
         self,
@@ -183,7 +188,6 @@ class PerformanceService:
         limit: int = 20,
     ) -> Dict[str, Any]:
         self.assert_org_member(user_id, organization_id)
-        self.assert_feature_enabled(organization_id, "advanced_reports")
         return self._trending_products_payload(organization_id, period, limit)
 
     def _trending_products_payload(
@@ -209,7 +213,6 @@ class PerformanceService:
         year: int | None = None,
     ) -> Dict[str, Any]:
         self.assert_org_member(user_id, organization_id)
-        self.assert_feature_enabled(organization_id, "advanced_reports")
         tz_name = self.DEFAULT_TIMEZONE
         selected_year = year or datetime.now(ZoneInfo(tz_name)).year
         months = []
@@ -256,6 +259,22 @@ class PerformanceService:
         self.assert_org_member(user_id, organization_id)
         return self._inventory_summary_payload(organization_id)
 
+    def get_activity_summary(
+        self,
+        user_id: str,
+        organization_id: str,
+        period: FinancialPeriod = FinancialPeriod.month,
+    ) -> Dict[str, Any]:
+        self.assert_org_member(user_id, organization_id)
+        tz_name = self.DEFAULT_TIMEZONE
+        start, end = self._financial_period_window(period, tz_name)
+        return {
+            "period": self._date_range_payload(start, end, tz_name),
+            "period_key": period.value,
+            "repair": self._repair_activity_metrics(organization_id, start, end),
+            "rental": self._rental_activity_metrics(organization_id, start, end),
+        }
+
     def _inventory_summary_payload(self, organization_id: str) -> Dict[str, Any]:
         tz_name = self.DEFAULT_TIMEZONE
         return self._inventory_summary(organization_id, tz_name)
@@ -267,7 +286,6 @@ class PerformanceService:
         period: FinancialPeriod = FinancialPeriod.month,
     ) -> Dict[str, Any]:
         self.assert_org_member(user_id, organization_id)
-        self.assert_feature_enabled(organization_id, "advanced_reports")
         return self._financial_summary_payload(organization_id, period)
 
     def _financial_summary_payload(
@@ -305,7 +323,6 @@ class PerformanceService:
         period: FinancialPeriod = FinancialPeriod.month,
     ) -> Dict[str, Any]:
         self.assert_org_member(user_id, organization_id)
-        self.assert_feature_enabled(organization_id, "advanced_reports")
         return self._sales_status_payload(organization_id, period)
 
     def _sales_status_payload(
@@ -315,6 +332,41 @@ class PerformanceService:
     ) -> Dict[str, Any]:
         tz_name = self.DEFAULT_TIMEZONE
         start, end = self._financial_period_window(period, tz_name)
+        try:
+            res = self.db.rpc(
+                "get_performance_sales_status_summary",
+                {
+                    "p_organization_id": organization_id,
+                    "p_start": start.isoformat(),
+                    "p_end": end.isoformat(),
+                },
+            ).execute()
+            rows = res.data or []
+            if rows:
+                row = rows[0]
+                total_orders = int(row.get("total_orders") or 0)
+                cancelled_orders = int(row.get("cancelled_orders") or 0)
+                cancellation_rate = Decimal("0")
+                if total_orders > 0:
+                    cancellation_rate = (
+                        Decimal(cancelled_orders) / Decimal(total_orders) * Decimal("100")
+                    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                return {
+                    "period": self._date_range_payload(start, end, tz_name),
+                    "period_key": period.value,
+                    "total_orders": total_orders,
+                    "pipeline_orders": int(row.get("pipeline_orders") or 0),
+                    "completed_orders": int(row.get("completed_orders") or 0),
+                    "cancelled_orders": cancelled_orders,
+                    "cancellation_rate_percent": cancellation_rate,
+                    "by_status": list(row.get("by_status") or []),
+                    "by_fulfillment_type": list(row.get("by_fulfillment_type") or []),
+                    "completed_revenue": list(row.get("completed_revenue") or []),
+                }
+        except APIError as exc:
+            if not self._rpc_missing(exc):
+                raise
+
         orders = self._select_rows_between(
             table="organization_customer_sale_orders",
             columns="id,status,fulfillment_type",
@@ -388,6 +440,11 @@ class PerformanceService:
             trend_period,
             10,
         )
+        activity_summary = self.get_activity_summary(
+            user_id,
+            organization_id,
+            period,
+        )
         anomalies = self._ai_anomalies(
             monthly=monthly,
             inventory=inventory,
@@ -416,6 +473,152 @@ class PerformanceService:
                 "sales_status": sales_status,
                 "top_products": top_products,
                 "trending_products": trending_products,
+                "activity_summary": activity_summary,
+            },
+        }
+
+    def _repair_activity_metrics(
+        self,
+        organization_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> Dict[str, Any]:
+        rows = self._execute_paged(
+            self.db.table("organization_repair_requests")
+            .select("id,status,quote_amount,currency,shop_id,assigned_member_id,created_at")
+            .eq("organization_id", organization_id)
+            .gte("created_at", start.isoformat())
+            .lt("created_at", end.isoformat())
+        )
+        parts = self._execute_paged(
+            self.db.table("organization_repair_request_parts")
+            .select("repair_request_id,resource_id,quantity,total_cost,currency,created_at")
+            .eq("organization_id", organization_id)
+            .gte("created_at", start.isoformat())
+            .lt("created_at", end.isoformat())
+        )
+        by_status: Dict[str, int] = {
+            key: 0
+            for key in (
+                "requested",
+                "received",
+                "diagnosing",
+                "quote_sent",
+                "approved",
+                "repairing",
+                "ready_for_pickup",
+                "delivered",
+                "cancelled",
+            )
+        }
+        quote_amounts: Dict[str, Decimal] = {}
+        parts_cost: Dict[str, Decimal] = {}
+        parts_quantity = 0
+        for row in rows:
+            status = str(row.get("status") or "requested")
+            by_status[status] = by_status.get(status, 0) + 1
+            amount = row.get("quote_amount")
+            if amount is not None:
+                currency = "xof"
+                quote_amounts[currency] = quote_amounts.get(currency, Decimal("0")) + Decimal(str(amount))
+        for part in parts:
+            quantity = int(part.get("quantity") or 0)
+            parts_quantity += quantity
+            currency = "xof"
+            parts_cost[currency] = parts_cost.get(currency, Decimal("0")) + Decimal(
+                str(part.get("total_cost") or "0")
+            )
+        return {
+            "total_requests": len(rows),
+            "active_requests": sum(
+                by_status.get(status, 0)
+                for status in (
+                    "requested",
+                    "received",
+                    "diagnosing",
+                    "quote_sent",
+                    "approved",
+                    "repairing",
+                    "ready_for_pickup",
+                )
+            ),
+            "completed_requests": by_status.get("delivered", 0),
+            "cancelled_requests": by_status.get("cancelled", 0),
+            "by_status": [
+                {"status": status, "count": count}
+                for status, count in by_status.items()
+            ],
+            "quote_amount": self._money_amounts(quote_amounts),
+            "parts_quantity_used": parts_quantity,
+            "parts_cost": self._money_amounts(parts_cost),
+        }
+
+    def _rental_activity_metrics(
+        self,
+        organization_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> Dict[str, Any]:
+        rows = self._execute_paged(
+            self.db.table("organization_rental_reservations")
+            .select("id,status,quantity,total_amount,deposit_amount,currency,shop_id,rental_asset_id,starts_at,ends_at,created_at")
+            .eq("organization_id", organization_id)
+            .gte("created_at", start.isoformat())
+            .lt("created_at", end.isoformat())
+        )
+        stocks = self._execute_paged(
+            self.db.table("organization_shop_article_stocks")
+            .select("stock_quantity,reserved_quantity,active")
+            .eq("organization_id", organization_id)
+            .eq("stock_scope", "rental_asset")
+        )
+        by_status: Dict[str, int] = {
+            key: 0
+            for key in (
+                "reserved",
+                "rented",
+                "returned",
+                "late",
+                "maintenance",
+                "cancelled",
+            )
+        }
+        revenue: Dict[str, Decimal] = {}
+        deposits: Dict[str, Decimal] = {}
+        quantity_reserved = 0
+        for row in rows:
+            status = str(row.get("status") or "reserved")
+            by_status[status] = by_status.get(status, 0) + 1
+            quantity_reserved += int(row.get("quantity") or 0)
+            currency = "xof"
+            revenue[currency] = revenue.get(currency, Decimal("0")) + Decimal(
+                str(row.get("total_amount") or "0")
+            )
+            deposits[currency] = deposits.get(currency, Decimal("0")) + Decimal(
+                str(row.get("deposit_amount") or "0")
+            )
+        total_stock = sum(int(row.get("stock_quantity") or 0) for row in stocks if row.get("active") is True)
+        total_reserved = sum(int(row.get("reserved_quantity") or 0) for row in stocks if row.get("active") is True)
+        return {
+            "total_reservations": len(rows),
+            "active_reservations": sum(
+                by_status.get(status, 0)
+                for status in ("reserved", "rented", "late", "maintenance")
+            ),
+            "completed_reservations": by_status.get("returned", 0),
+            "cancelled_reservations": by_status.get("cancelled", 0),
+            "by_status": [
+                {"status": status, "count": count}
+                for status, count in by_status.items()
+            ],
+            "quantity_reserved": quantity_reserved,
+            "revenue": self._money_amounts(revenue),
+            "deposits": self._money_amounts(deposits),
+            "stock": {
+                "assets_count": len([row for row in stocks if row.get("active") is True]),
+                "stock_quantity": total_stock,
+                "reserved_quantity": total_reserved,
+                "available_quantity": max(total_stock - total_reserved, 0),
             },
         }
 
@@ -427,7 +630,6 @@ class PerformanceService:
         limit: int = 10,
     ) -> Dict[str, Any]:
         self.assert_org_member(user_id, organization_id)
-        self.assert_feature_enabled(organization_id, "advanced_reports")
         tz_name = self.DEFAULT_TIMEZONE
         trend_period = self._trend_period_for_financial_period(period)
         return {
@@ -452,6 +654,11 @@ class PerformanceService:
                 organization_id,
                 trend_period,
                 limit,
+            ),
+            "activity_summary": self.get_activity_summary(
+                user_id,
+                organization_id,
+                period,
             ),
         }
 
@@ -752,6 +959,7 @@ class PerformanceService:
                 self.db.table("organization_articles")
                 .select("id,name,category")
                 .eq("organization_id", organization_id)
+                .eq("resource_scope", "sales_item")
                 .in_("id", chunk)
             )
             for article in self._execute_paged(query):
@@ -772,6 +980,7 @@ class PerformanceService:
                 self.db.table("organization_articles")
                 .select("id,name,category,stock_quantity,reserved_quantity,stock_status")
                 .eq("organization_id", organization_id)
+                .eq("resource_scope", "sales_item")
                 .in_("id", chunk)
             )
             for article in self._execute_paged(query):
@@ -841,7 +1050,7 @@ class PerformanceService:
         order_ids = {str(row["order_id"]) for row in rows if row.get("order_id")}
         amounts: Dict[str, Decimal] = {}
         for line in rows:
-            currency = self._normalize_currency(line.get("currency"), "eur")
+            currency = self._normalize_currency(line.get("currency"))
             total = Decimal(str(line.get("total_price") or "0"))
             amounts[currency] = amounts.get(currency, Decimal("0")) + total
         return {"count": len(order_ids), "amounts": self._quantize_money_map(amounts)}
@@ -871,6 +1080,7 @@ class PerformanceService:
             self.db.table("organization_articles")
             .select("active,stock_status")
             .eq("organization_id", organization_id)
+            .eq("resource_scope", "sales_item")
         )
         rows = self._execute_paged(query)
         active_rows = [row for row in rows if row.get("active") is True]
@@ -886,10 +1096,64 @@ class PerformanceService:
         organization_id: str,
         timezone_name: str,
     ) -> Dict[str, Any]:
+        try:
+            res = self.db.rpc(
+                "get_performance_inventory_summary",
+                {"p_organization_id": organization_id},
+            ).execute()
+            rows = res.data or []
+            if rows:
+                row = rows[0]
+                stock_quantity = int(row.get("stock_quantity") or 0)
+                reserved_quantity = int(row.get("reserved_quantity") or 0)
+                return {
+                    "generated_at": datetime.now(ZoneInfo(timezone_name)).isoformat(),
+                    "timezone": timezone_name,
+                    "products": {
+                        "total_products": int(row.get("total_products") or 0),
+                        "active_products": int(row.get("active_products") or 0),
+                        "inactive_products": int(row.get("inactive_products") or 0),
+                    },
+                    "stock_status": {
+                        "in_stock_products": int(row.get("in_stock_products") or 0),
+                        "low_stock_products": int(row.get("low_stock_products") or 0),
+                        "out_of_stock_products": int(row.get("out_of_stock_products") or 0),
+                        "active_in_stock_products": int(
+                            row.get("active_in_stock_products") or 0
+                        ),
+                        "active_low_stock_products": int(
+                            row.get("active_low_stock_products") or 0
+                        ),
+                        "active_out_of_stock_products": int(
+                            row.get("active_out_of_stock_products") or 0
+                        ),
+                    },
+                    "quantities": {
+                        "stock_quantity": stock_quantity,
+                        "reserved_quantity": reserved_quantity,
+                        "available_quantity": max(stock_quantity - reserved_quantity, 0),
+                    },
+                    "alerts": {
+                        "active_products_out_of_stock": int(
+                            row.get("active_out_of_stock_products") or 0
+                        ),
+                        "active_products_low_stock": int(
+                            row.get("active_low_stock_products") or 0
+                        ),
+                        "active_products_with_reserved_stock": int(
+                            row.get("active_products_with_reserved_stock") or 0
+                        ),
+                    },
+                }
+        except APIError as exc:
+            if not self._rpc_missing(exc):
+                raise
+
         query = (
             self.db.table("organization_articles")
             .select("active,stock_status,stock_quantity,reserved_quantity")
             .eq("organization_id", organization_id)
+            .eq("resource_scope", "sales_item")
         )
         rows = self._execute_paged(query)
         active_rows = [row for row in rows if row.get("active") is True]
@@ -1110,9 +1374,7 @@ class PerformanceService:
 
     @staticmethod
     def _normalize_currency(value: Any, fallback: str = "xof") -> str:
-        raw = str(value or fallback).strip().lower()
-        allowed = {currency.value for currency in CurrencyCode}
-        return raw if raw in allowed else fallback
+        return "xof"
 
     @staticmethod
     def _quantize_money_map(amounts: Dict[str, Decimal]) -> Dict[str, Decimal]:

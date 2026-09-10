@@ -165,9 +165,16 @@ class MessagingService:
         return out
 
     def list_conversations(
-        self, access_token: str, user_id: str
+        self,
+        access_token: str,
+        user_id: str,
+        *,
+        limit: int = 50,
+        offset: int = 0,
     ) -> List[ConversationListItem]:
         client = self._db(access_token)
+        page_limit = max(1, min(int(limit or 50), 200))
+        page_offset = max(0, int(offset or 0))
         res = self._postgrest_execute(
             lambda: client.table("conversation_participants")
             .select(
@@ -190,6 +197,7 @@ class MessagingService:
             return s.created_at
 
         summaries.sort(key=sort_key, reverse=True)
+        summaries = summaries[page_offset : page_offset + page_limit]
 
         direct_ids = [
             str(s.id)
@@ -388,6 +396,8 @@ class MessagingService:
         organization_id: str,
         *,
         include_self: bool = False,
+        limit: int = 50,
+        offset: int = 0,
     ) -> List[OrganizationMemberForMessaging]:
         """
         Retourne les membres actifs d'une organisation pour démarrer un chat.
@@ -407,21 +417,28 @@ class MessagingService:
                 "Accès refusé : vous n'êtes pas membre actif de cette organisation"
             )
 
-        rows = (
+        page_limit = max(1, min(int(limit or 50), 200))
+        page_offset = max(0, int(offset or 0))
+        query = (
             self.admin_db.table("members")
             .select(
                 "user_id, member_type, member_role, users(id, username, first_name, last_name, profile_picture, user_type)"
             )
             .eq("organization_id", organization_id)
             .eq("activity_status", True)
+        )
+        if not include_self:
+            query = query.neq("user_id", requester_user_id)
+        rows = (
+            query
+            .order("created_at", desc=False)
+            .range(page_offset, page_offset + page_limit - 1)
             .execute()
         ).data or []
 
         out: List[OrganizationMemberForMessaging] = []
         for row in rows:
             uid = str(row.get("user_id"))
-            if (not include_self) and uid == requester_user_id:
-                continue
             u = row.get("users") or {}
             out.append(
                 OrganizationMemberForMessaging(

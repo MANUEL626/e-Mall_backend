@@ -12,7 +12,12 @@ from features.auth.auth_service import AuthService
 from features.organization_articles.organization_articles_models import (
     OrganizationArticleCreate,
     OrganizationArticleResponse,
+    OrganizationArticleStockPatch,
     OrganizationArticleUpdate,
+    OrganizationStockScope,
+    ShopStockResourceCreate,
+    ShopStockResourceResponse,
+    ShopStockResourceUpdate,
 )
 from features.organization_article_posts.organization_article_posts_models import (
     OrganizationArticlePostResponse,
@@ -30,6 +35,16 @@ from features.organization_articles.organization_articles_service import (
 router = APIRouter(
     prefix="/api/v1/organizations/{organization_id}/articles",
     tags=["Organization articles"],
+)
+
+shop_articles_router = APIRouter(
+    prefix="/api/v1/organizations/{organization_id}/shops/{shop_id}/articles",
+    tags=["Organization shop articles"],
+)
+
+shop_stock_resources_router = APIRouter(
+    prefix="/api/v1/organizations/{organization_id}/shops/{shop_id}/stock-resources",
+    tags=["Organization shop stock resources"],
 )
 
 security = HTTPBearer()
@@ -62,18 +77,39 @@ def list_organization_articles(
         None,
         description="Si true/false, filtre sur `active` ; si omis, tous les articles.",
     ),
+    shop_id: UUID = Query(
+        ...,
+        description="Boutique de vente cible pour lire le stock local. Obligatoire en phase multi-boutiques.",
+    ),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
     """Liste les articles de l'organisation (membre actif requis)."""
     uid = _current_user_id(credentials)
     try:
         rows = _service.list_articles(
-            uid, str(organization_id), active_only=active_only
+            uid,
+            str(organization_id),
+            active_only=active_only,
+            shop_id=str(shop_id),
+            limit=limit,
+            offset=offset,
         )
         return [OrganizationArticleResponse.model_validate(r) for r in rows]
     except PermissionError as exc:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(exc),
         ) from exc
 
@@ -107,17 +143,31 @@ def list_organization_article_posts_batch(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
 
 
 @router.get("/{article_id}", response_model=OrganizationArticleResponse)
 def get_organization_article(
     organization_id: UUID,
     article_id: UUID,
+    shop_id: UUID = Query(
+        ...,
+        description="Boutique de vente cible pour lire le stock local. Obligatoire en phase multi-boutiques.",
+    ),
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
     uid = _current_user_id(credentials)
     try:
-        row = _service.get_article(uid, str(organization_id), str(article_id))
+        row = _service.get_article(
+            uid,
+            str(organization_id),
+            str(article_id),
+            shop_id=str(shop_id),
+        )
         return OrganizationArticleResponse.model_validate(row)
     except PermissionError as exc:
         raise HTTPException(
@@ -127,6 +177,11 @@ def get_organization_article(
     except LookupError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
         ) from exc
 
@@ -152,6 +207,49 @@ def create_organization_article(
     except PermissionError as exc:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
+
+
+@router.patch("/{article_id}/stock", response_model=OrganizationArticleResponse)
+def update_organization_article_stock(
+    organization_id: UUID,
+    article_id: UUID,
+    body: OrganizationArticleStockPatch,
+    shop_id: UUID = Query(
+        ...,
+        description="Boutique de vente dont le stock doit etre modifie.",
+    ),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    uid = _current_user_id(credentials)
+    try:
+        row = _service.patch_article_stock(
+            uid,
+            str(organization_id),
+            str(article_id),
+            str(shop_id),
+            body,
+        )
+        return OrganizationArticleResponse.model_validate(row)
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         ) from exc
     except ValueError as exc:
@@ -220,3 +318,279 @@ def delete_organization_article(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         ) from exc
+
+
+@shop_articles_router.get("", response_model=List[OrganizationArticleResponse])
+def list_shop_articles(
+    organization_id: UUID,
+    shop_id: UUID,
+    active_only: Optional[bool] = Query(
+        None,
+        description="Si true/false, filtre sur `active` ; si omis, tous les articles.",
+    ),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    uid = _current_user_id(credentials)
+    try:
+        rows = _service.list_articles(
+            uid,
+            str(organization_id),
+            active_only=active_only,
+            shop_id=str(shop_id),
+            limit=limit,
+            offset=offset,
+        )
+        return [OrganizationArticleResponse.model_validate(row) for row in rows]
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
+
+
+@shop_articles_router.post(
+    "",
+    response_model=OrganizationArticleResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_shop_article(
+    organization_id: UUID,
+    shop_id: UUID,
+    body: OrganizationArticleCreate,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    uid = _current_user_id(credentials)
+    try:
+        row = _service.create_article(
+            uid,
+            str(organization_id),
+            body.model_copy(update={"shop_id": shop_id}),
+        )
+        return OrganizationArticleResponse.model_validate(row)
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
+
+
+@shop_articles_router.get("/{article_id}", response_model=OrganizationArticleResponse)
+def get_shop_article(
+    organization_id: UUID,
+    shop_id: UUID,
+    article_id: UUID,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    uid = _current_user_id(credentials)
+    try:
+        row = _service.get_article(
+            uid,
+            str(organization_id),
+            str(article_id),
+            shop_id=str(shop_id),
+        )
+        return OrganizationArticleResponse.model_validate(row)
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@shop_articles_router.patch(
+    "/{article_id}",
+    response_model=OrganizationArticleResponse,
+)
+def update_shop_article(
+    organization_id: UUID,
+    shop_id: UUID,
+    article_id: UUID,
+    body: OrganizationArticleUpdate,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    uid = _current_user_id(credentials)
+    try:
+        row = _service.update_article(
+            uid,
+            str(organization_id),
+            str(article_id),
+            body.model_copy(update={"shop_id": shop_id}),
+        )
+        return OrganizationArticleResponse.model_validate(row)
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
+
+
+@shop_articles_router.patch(
+    "/{article_id}/stock",
+    response_model=OrganizationArticleResponse,
+)
+def update_shop_article_stock(
+    organization_id: UUID,
+    shop_id: UUID,
+    article_id: UUID,
+    body: OrganizationArticleStockPatch,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    uid = _current_user_id(credentials)
+    try:
+        row = _service.patch_article_stock(
+            uid,
+            str(organization_id),
+            str(article_id),
+            str(shop_id),
+            body,
+        )
+        return OrganizationArticleResponse.model_validate(row)
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
+
+
+@shop_stock_resources_router.get("", response_model=List[ShopStockResourceResponse])
+def list_shop_stock_resources(
+    organization_id: UUID,
+    shop_id: UUID,
+    active_only: Optional[bool] = Query(
+        None,
+        description="Si true/false, filtre les ressources actives/inactives.",
+    ),
+    stock_scope: Optional[OrganizationStockScope] = Query(
+        None,
+        description="repair_supply, repair_tool ou rental_asset selon le type de boutique.",
+    ),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    uid = _current_user_id(credentials)
+    try:
+        rows = _service.list_stock_resources(
+            uid,
+            str(organization_id),
+            str(shop_id),
+            active_only=active_only,
+            stock_scope=stock_scope,
+            limit=limit,
+            offset=offset,
+        )
+        return [ShopStockResourceResponse.model_validate(row) for row in rows]
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@shop_stock_resources_router.post(
+    "",
+    response_model=ShopStockResourceResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_shop_stock_resource(
+    organization_id: UUID,
+    shop_id: UUID,
+    body: ShopStockResourceCreate,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    uid = _current_user_id(credentials)
+    try:
+        row = _service.create_stock_resource(
+            uid,
+            str(organization_id),
+            str(shop_id),
+            body,
+        )
+        return ShopStockResourceResponse.model_validate(row)
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
+
+
+@shop_stock_resources_router.get(
+    "/{resource_id}",
+    response_model=ShopStockResourceResponse,
+)
+def get_shop_stock_resource(
+    organization_id: UUID,
+    shop_id: UUID,
+    resource_id: UUID,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    uid = _current_user_id(credentials)
+    try:
+        row = _service.get_stock_resource(
+            uid,
+            str(organization_id),
+            str(shop_id),
+            str(resource_id),
+        )
+        return ShopStockResourceResponse.model_validate(row)
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@shop_stock_resources_router.patch(
+    "/{resource_id}",
+    response_model=ShopStockResourceResponse,
+)
+def update_shop_stock_resource(
+    organization_id: UUID,
+    shop_id: UUID,
+    resource_id: UUID,
+    body: ShopStockResourceUpdate,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    uid = _current_user_id(credentials)
+    try:
+        row = _service.update_stock_resource(
+            uid,
+            str(organization_id),
+            str(shop_id),
+            str(resource_id),
+            body,
+        )
+        return ShopStockResourceResponse.model_validate(row)
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc

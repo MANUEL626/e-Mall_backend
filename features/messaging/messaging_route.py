@@ -79,12 +79,14 @@ def open_or_get_direct_conversation(
 
 @router.get("/conversations", response_model=List[ConversationListItem])
 def list_my_conversations(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
     """Liste les conversations dont l'utilisateur est participant (tri récent)."""
     token = credentials.credentials
     uid = _current_user_id(credentials)
-    return _service.list_conversations(token, uid)
+    return _service.list_conversations(token, uid, limit=limit, offset=offset)
 
 
 @router.get(
@@ -97,6 +99,8 @@ def list_organization_members_for_messaging(
         False,
         description="Inclure ou non l'utilisateur courant dans la liste.",
     ),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
     """
@@ -109,6 +113,8 @@ def list_organization_members_for_messaging(
             requester_user_id=uid,
             organization_id=str(organization_id),
             include_self=include_self,
+            limit=limit,
+            offset=offset,
         )
     except PermissionError as exc:
         raise HTTPException(

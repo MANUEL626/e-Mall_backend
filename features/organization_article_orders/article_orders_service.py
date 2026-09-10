@@ -5,6 +5,7 @@ Commandes d'articles : création, liste, réception (stock), annulation.
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional
 
+from postgrest.exceptions import APIError
 from supabase import Client
 
 from config.supabase_client import supabase_admin
@@ -16,6 +17,14 @@ from features.organization_articles.organization_articles_models import Currency
 from features.organization_subscriptions.organization_subscriptions_service import (
     OrganizationSubscriptionFeatureDenied,
     OrganizationSubscriptionService,
+)
+
+_ARTICLE_ORDER_SELECT = (
+    "id,organization_id,shop_id,status,currency,note,created_at,updated_at,"
+    "organization_article_order_lines("
+    "id,order_id,article_id,quantity_ordered,unit_price,total_price,"
+    "quantity_received,shortage_reason,received_at,created_at"
+    ")"
 )
 
 
@@ -40,25 +49,39 @@ class ArticleOrdersService:
             )
 
     def _organization_default_purchase_currency(self, organization_id: str) -> str:
+        return CurrencyCode.xof.value
+
+    def _assert_sales_shop(self, organization_id: str, shop_id: str) -> None:
         res = (
-            self.db.table("organizations")
-            .select("default_currencies")
-            .eq("id", organization_id)
+            self.db.table("organization_shops")
+            .select("id")
+            .eq("id", shop_id)
+            .eq("organization_id", organization_id)
+            .eq("shop_type", "sales")
+            .neq("status", "archived")
             .limit(1)
             .execute()
         )
-        rows = res.data or []
-        defaults = rows[0].get("default_currencies") if rows else None
-        purchase = (
-            str(defaults.get("purchase") or CurrencyCode.eur.value).strip().lower()
-            if isinstance(defaults, dict)
-            else CurrencyCode.eur.value
-        )
-        allowed = {c.value for c in CurrencyCode}
-        return purchase if purchase in allowed else CurrencyCode.eur.value
+        if not (res.data or []):
+            raise ValueError("Boutique de vente introuvable pour cette organisation")
 
     def _normalize_money(self, value: Decimal, scale: str = "0.01") -> Decimal:
         return Decimal(str(value)).quantize(Decimal(scale), rounding=ROUND_HALF_UP)
+
+    @staticmethod
+    def _rpc_missing(exc: APIError) -> bool:
+        code = getattr(exc, "code", None)
+        return code in {"PGRST202", "PGRST204", "PGRST205"}
+
+    def _normalize_rpc_order_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        for row in rows:
+            lines = row.get("organization_article_order_lines")
+            if not isinstance(lines, list):
+                row["organization_article_order_lines"] = []
+            row["total_amount"] = self._normalize_money(
+                Decimal(str(row.get("total_amount") or "0"))
+            )
+        return rows
 
     def _attach_total_amount(self, row: Dict[str, Any]) -> Dict[str, Any]:
         lines = row.get("organization_article_order_lines") or []
@@ -72,7 +95,7 @@ class ArticleOrdersService:
     def _select_order_with_lines(self, order_id: str) -> Dict[str, Any]:
         res = (
             self.db.table("organization_article_orders")
-            .select("*, organization_article_order_lines(*)")
+            .select(_ARTICLE_ORDER_SELECT)
             .eq("id", order_id)
             .limit(1)
             .execute()
@@ -98,16 +121,17 @@ class ArticleOrdersService:
         except OrganizationSubscriptionFeatureDenied as exc:
             raise PermissionError(str(exc)) from exc
         oid = str(organization_id)
-        currency = (
-            body.currency.value
-            if body.currency is not None
-            else self._organization_default_purchase_currency(oid)
-        )
+        if body.shop_id is None:
+            raise ValueError("shop_id est requis pour creer une commande fournisseur")
+        shop_id = str(body.shop_id)
+        self._assert_sales_shop(oid, shop_id)
+        currency = CurrencyCode.xof.value
         oins = (
             self.db.table("organization_article_orders")
             .insert(
                 {
                     "organization_id": oid,
+                    "shop_id": shop_id,
                     "status": "open",
                     "currency": currency,
                     "note": body.note.strip() if body.note and body.note.strip() else None,
@@ -152,17 +176,43 @@ class ArticleOrdersService:
         user_id: str,
         organization_id: str,
         status: Optional[str] = None,
+        shop_id: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
     ) -> List[Dict[str, Any]]:
         self.assert_org_member(user_id, organization_id)
+        if shop_id is not None:
+            self._assert_sales_shop(str(organization_id), shop_id)
+        safe_limit = max(1, min(int(limit), 200))
+        safe_offset = max(0, int(offset))
+        try:
+            res = self.db.rpc(
+                "list_article_orders_with_lines",
+                {
+                    "p_user_id": user_id,
+                    "p_organization_id": str(organization_id),
+                    "p_shop_id": shop_id,
+                    "p_status": status,
+                    "p_limit": safe_limit,
+                    "p_offset": safe_offset,
+                },
+            ).execute()
+            return self._normalize_rpc_order_rows(list(res.data or []))
+        except APIError as exc:
+            if not self._rpc_missing(exc):
+                raise
+
         q = (
             self.db.table("organization_article_orders")
-            .select("*, organization_article_order_lines(*)")
+            .select(_ARTICLE_ORDER_SELECT)
             .eq("organization_id", str(organization_id))
             .order("created_at", desc=True)
         )
         if status is not None:
             q = q.eq("status", status)
-        res = q.execute()
+        if shop_id is not None:
+            q = q.eq("shop_id", shop_id)
+        res = q.range(safe_offset, safe_offset + safe_limit - 1).execute()
         rows = res.data or []
         for row in rows:
             if row.get("organization_article_order_lines") is None:

@@ -24,6 +24,9 @@ class CustomerCatalogProduct(BaseModel):
     id: UUID
     organization_id: UUID
     organization_name: str
+    shop_id: Optional[UUID] = None
+    shop_name: Optional[str] = None
+    shop_type: Optional[str] = None
     name: str
     category: ArticleCategory
     unit_sale_price: Decimal = Field(..., ge=0)
@@ -94,6 +97,9 @@ class CustomerArticlePostFeedItem(BaseModel):
 
     organization_id: UUID
     organization_name: str
+    shop_id: Optional[UUID] = None
+    shop_name: Optional[str] = None
+    shop_type: Optional[str] = None
     organization_article_id: UUID
     name: str
     category: ArticleCategory

@@ -18,6 +18,7 @@ class AddWishlistItemBody(BaseModel):
 
 class AddCartItemBody(BaseModel):
     organization_article_id: UUID
+    shop_id: UUID | None = None
     quantity: int = Field(default=1, ge=1, le=99_999)
 
 
@@ -39,6 +40,9 @@ class CustomerCartGroup(BaseModel):
     cart_id: UUID
     organization_id: UUID
     organization_name: str
+    shop_id: UUID
+    shop_name: str = ""
+    shop_type: str = "sales"
     updated_at: datetime
     items: List[CustomerCartLineItem]
 

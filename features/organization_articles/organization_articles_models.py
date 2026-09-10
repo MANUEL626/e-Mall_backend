@@ -32,6 +32,13 @@ class ArticleStockStatus(str, Enum):
     out_of_stock = "out_of_stock"
 
 
+class OrganizationStockScope(str, Enum):
+    sales_item = "sales_item"
+    repair_supply = "repair_supply"
+    repair_tool = "repair_tool"
+    rental_asset = "rental_asset"
+
+
 class CurrencyCode(str, Enum):
     """Codes devises supportes par l'application (ISO 4217 en minuscules)."""
 
@@ -97,6 +104,7 @@ class OrganizationArticleCreate(BaseModel):
     wholesale_prices: Optional[List[WholesalePriceTier]] = None
     stock_quantity: int = Field(0, ge=0)
     alert_quantity: int = Field(0, ge=0)
+    shop_id: Optional[UUID] = None
     description: Optional[str] = Field(None, max_length=10000)
     primary_image_storage_path: str = Field(..., min_length=1, max_length=1024)
     additional_image_storage_paths: List[str] = Field(default_factory=list)
@@ -117,6 +125,7 @@ class OrganizationArticleUpdate(BaseModel):
     wholesale_prices: Optional[List[WholesalePriceTier]] = None
     stock_quantity: Optional[int] = Field(None, ge=0)
     alert_quantity: Optional[int] = Field(None, ge=0)
+    shop_id: Optional[UUID] = None
     description: Optional[str] = Field(None, max_length=10000)
     primary_image_storage_path: Optional[str] = Field(None, min_length=1, max_length=1024)
     additional_image_storage_paths: Optional[List[str]] = None
@@ -140,8 +149,11 @@ class OrganizationArticleResponse(BaseModel):
     stock_quantity: int
     alert_quantity: int
     stock_status: ArticleStockStatus
+    shop_id: Optional[UUID] = None
+    reserved_quantity: int = 0
+    stock_scope: str = "sales_item"
     description: Optional[str] = None
-    primary_image_storage_path: str
+    primary_image_storage_path: Optional[str] = None
     additional_image_storage_paths: List[str] = Field(default_factory=list)
     active: bool
     created_at: datetime
@@ -155,3 +167,101 @@ class OrganizationArticleResponse(BaseModel):
         return v
 
     model_config = {"from_attributes": True}
+
+
+class ShopStockResourceCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=500)
+    stock_scope: OrganizationStockScope
+    stock_quantity: int = Field(0, ge=0)
+    alert_quantity: int = Field(0, ge=0)
+    unit_purchase_price: Decimal = Field(Decimal("0"), ge=0)
+    unit_rental_price: Optional[Decimal] = Field(None, ge=0)
+    rental_currency: Optional[CurrencyCode] = None
+    rental_bulk_prices: Optional[List[WholesalePriceTier]] = None
+    description: Optional[str] = Field(None, max_length=10000)
+    category: ArticleCategory = ArticleCategory.other
+    primary_image_storage_path: Optional[str] = Field(None, min_length=1, max_length=1024)
+    additional_image_storage_paths: List[str] = Field(default_factory=list)
+    active: bool = True
+
+    @model_validator(mode="after")
+    def resource_scope_only(self) -> "ShopStockResourceCreate":
+        if self.stock_scope == OrganizationStockScope.sales_item:
+            raise ValueError("Utiliser les endpoints articles pour le stock sales_item")
+        if self.stock_scope != OrganizationStockScope.rental_asset:
+            if self.unit_rental_price is not None or self.rental_bulk_prices is not None:
+                raise ValueError("Les prix de location sont reserves aux rental_asset")
+        if self.rental_bulk_prices:
+            validate_wholesale_tiers_contiguous(self.rental_bulk_prices)
+        return self
+
+
+class ShopStockResourceUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=500)
+    stock_quantity: Optional[int] = Field(None, ge=0)
+    alert_quantity: Optional[int] = Field(None, ge=0)
+    unit_purchase_price: Optional[Decimal] = Field(None, ge=0)
+    unit_rental_price: Optional[Decimal] = Field(None, ge=0)
+    rental_currency: Optional[CurrencyCode] = None
+    rental_bulk_prices: Optional[List[WholesalePriceTier]] = None
+    description: Optional[str] = Field(None, max_length=10000)
+    category: Optional[ArticleCategory] = None
+    primary_image_storage_path: Optional[str] = Field(None, min_length=1, max_length=1024)
+    additional_image_storage_paths: Optional[List[str]] = None
+    active: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def wholesale_tiers_contiguous(self) -> "ShopStockResourceUpdate":
+        if self.rental_bulk_prices is not None and len(self.rental_bulk_prices) > 1:
+            validate_wholesale_tiers_contiguous(self.rental_bulk_prices)
+        return self
+
+
+class ShopStockResourceResponse(BaseModel):
+    id: UUID
+    organization_id: UUID
+    shop_id: UUID
+    name: str
+    category: ArticleCategory
+    stock_scope: OrganizationStockScope
+    stock_quantity: int
+    reserved_quantity: int = 0
+    alert_quantity: int
+    stock_status: ArticleStockStatus
+    unit_purchase_price: Decimal = Decimal("0")
+    unit_rental_price: Optional[Decimal] = None
+    rental_currency: Optional[CurrencyCode] = None
+    rental_bulk_prices: Optional[Any] = None
+    description: Optional[str] = None
+    primary_image_storage_path: Optional[str] = None
+    additional_image_storage_paths: List[str] = Field(default_factory=list)
+    active: bool
+    created_at: datetime
+    updated_at: datetime
+
+    @field_validator("additional_image_storage_paths", mode="before")
+    @classmethod
+    def coerce_additional(cls, v: Any) -> Any:
+        if v is None:
+            return []
+        return v
+
+    model_config = {"from_attributes": True}
+
+
+class OrganizationArticleStockPatch(BaseModel):
+    stock_quantity: Optional[int] = Field(None, ge=0)
+    alert_quantity: Optional[int] = Field(None, ge=0)
+    active: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def at_least_one_field(self) -> "OrganizationArticleStockPatch":
+        if (
+            self.stock_quantity is None
+            and self.alert_quantity is None
+            and self.active is None
+        ):
+            raise ValueError(
+                "Au moins un parmi stock_quantity, alert_quantity, active est requis"
+            )
+        return self

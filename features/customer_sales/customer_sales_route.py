@@ -76,6 +76,11 @@ org_router = APIRouter(
     tags=["Customer sales"],
 )
 
+shop_org_router = APIRouter(
+    prefix="/api/v1/organizations/{organization_id}/shops/{shop_id}/customer-sales",
+    tags=["Customer sales"],
+)
+
 
 def _bucket_param(
     bucket: Optional[StatusGroup] = Query(
@@ -88,6 +93,15 @@ def _bucket_param(
     ),
 ) -> Optional[StatusGroup]:
     return bucket or status_group
+
+
+def _assert_sale_shop(row: Dict[str, Any], shop_id: UUID) -> None:
+    order = row.get("order") if "order" in row else row
+    if str(order.get("shop_id")) != str(shop_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Vente introuvable dans cette boutique",
+        )
 
 
 @customer_router.post("", response_model=SaleOrderDetailOut, status_code=status.HTTP_201_CREATED)
@@ -107,9 +121,11 @@ def create_customer_sale_order(
 def list_my_customer_sale_orders(
     user_id: str = Depends(_current_user_id),
     group: Optional[StatusGroup] = Depends(_bucket_param),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
 ):
     try:
-        rows = _service.list_customer_orders(user_id, group)
+        rows = _service.list_customer_orders(user_id, group, limit=limit, offset=offset)
         return [_detail_from_row(r) for r in rows]
     except (LookupError, PermissionError) as exc:
         raise _exc(exc, user_id) from exc
@@ -192,11 +208,24 @@ def list_org_customer_sales(
     organization_id: UUID,
     user_id: str = Depends(_current_user_id),
     group: Optional[StatusGroup] = Depends(_bucket_param),
+    shop_id: Optional[UUID] = Query(
+        None,
+        description="Filtrer les ventes d'une boutique de vente.",
+    ),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
 ):
     try:
-        rows = _service.list_org_orders(user_id, str(organization_id), group)
+        rows = _service.list_org_orders(
+            user_id,
+            str(organization_id),
+            group,
+            shop_id=str(shop_id) if shop_id is not None else None,
+            limit=limit,
+            offset=offset,
+        )
         return [_detail_from_row(r) for r in rows]
-    except PermissionError as exc:
+    except (PermissionError, ValueError) as exc:
         raise _exc(exc) from exc
 
 
@@ -367,6 +396,254 @@ def get_delivery_qr(
             qr_payload=d["qr_payload"],
         )
     except (PermissionError, LookupError, ValueError, RuntimeError) as exc:
+        raise _exc(exc) from exc
+
+@shop_org_router.get("", response_model=List[SaleOrderDetailOut])
+def list_shop_customer_sales(
+    organization_id: UUID,
+    shop_id: UUID,
+    user_id: str = Depends(_current_user_id),
+    group: Optional[StatusGroup] = Depends(_bucket_param),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    try:
+        rows = _service.list_org_orders(
+            user_id,
+            str(organization_id),
+            group,
+            shop_id=str(shop_id),
+            limit=limit,
+            offset=offset,
+        )
+        return [_detail_from_row(row) for row in rows]
+    except (PermissionError, ValueError) as exc:
+        raise _exc(exc) from exc
+
+
+@shop_org_router.post(
+    "/walk-in",
+    response_model=SaleOrderDetailOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_shop_walk_in_sale(
+    organization_id: UUID,
+    shop_id: UUID,
+    body: WalkInSaleCreate,
+    user_id: str = Depends(_current_user_id),
+):
+    try:
+        row = _service.walk_in_sale(
+            user_id,
+            str(organization_id),
+            body.model_copy(update={"shop_id": shop_id}),
+        )
+        return _detail_from_row(row)
+    except (PermissionError, LookupError, ValueError, RuntimeError) as exc:
+        raise _exc(exc) from exc
+
+
+@shop_org_router.get("/{order_id}", response_model=SaleOrderDetailOut)
+def get_shop_customer_sale_order(
+    organization_id: UUID,
+    shop_id: UUID,
+    order_id: UUID,
+    user_id: str = Depends(_current_user_id),
+):
+    try:
+        row = _service.get_org_order(user_id, str(organization_id), str(order_id))
+        _assert_sale_shop(row, shop_id)
+        return _detail_from_row(row)
+    except (PermissionError, LookupError) as exc:
+        raise _exc(exc) from exc
+
+
+@shop_org_router.patch("/{order_id}/status", response_model=SaleOrderDetailOut)
+def patch_shop_sale_status(
+    organization_id: UUID,
+    shop_id: UUID,
+    order_id: UUID,
+    body: PatchOrderStatusBody,
+    user_id: str = Depends(_current_user_id),
+):
+    try:
+        existing = _service.get_org_order(user_id, str(organization_id), str(order_id))
+        _assert_sale_shop(existing, shop_id)
+        row = _service.patch_order_status(
+            user_id,
+            str(organization_id),
+            str(order_id),
+            body,
+        )
+        return _detail_from_row(row)
+    except (PermissionError, LookupError, ValueError) as exc:
+        raise _exc(exc) from exc
+
+
+@shop_org_router.get("/{order_id}/history", response_model=List[StatusEventOut])
+def list_shop_sale_history(
+    organization_id: UUID,
+    shop_id: UUID,
+    order_id: UUID,
+    user_id: str = Depends(_current_user_id),
+):
+    try:
+        existing = _service.get_org_order(user_id, str(organization_id), str(order_id))
+        _assert_sale_shop(existing, shop_id)
+        rows = _service.list_org_order_history(
+            user_id,
+            str(organization_id),
+            str(order_id),
+        )
+        return [StatusEventOut.model_validate(row) for row in rows]
+    except (PermissionError, LookupError) as exc:
+        raise _exc(exc) from exc
+
+
+@shop_org_router.get(
+    "/{order_id}/delivery-track",
+    response_model=List[DeliveryTrackPointOut],
+)
+def list_shop_delivery_track(
+    organization_id: UUID,
+    shop_id: UUID,
+    order_id: UUID,
+    user_id: str = Depends(_current_user_id),
+    since: Optional[datetime] = Query(
+        None,
+        description="Points avec recorded_at >= since (ISO 8601).",
+    ),
+    limit: int = Query(200, ge=1, le=500),
+):
+    try:
+        existing = _service.get_org_order(user_id, str(organization_id), str(order_id))
+        _assert_sale_shop(existing, shop_id)
+        rows = _service.list_delivery_track_points_org(
+            user_id,
+            str(organization_id),
+            str(order_id),
+            since=since,
+            limit=limit,
+        )
+        return [DeliveryTrackPointOut.model_validate(row) for row in rows]
+    except (PermissionError, LookupError, ValueError) as exc:
+        raise _exc(exc) from exc
+
+
+@shop_org_router.post("/{order_id}/receipt-token", response_model=ReceiptTokenCreated)
+def post_shop_receipt_token(
+    organization_id: UUID,
+    shop_id: UUID,
+    order_id: UUID,
+    user_id: str = Depends(_current_user_id),
+):
+    try:
+        existing = _service.get_org_order(user_id, str(organization_id), str(order_id))
+        _assert_sale_shop(existing, shop_id)
+        data = _service.upsert_receipt_token(
+            user_id,
+            str(organization_id),
+            str(order_id),
+        )
+        return ReceiptTokenCreated(
+            order_id=UUID(data["order_id"]),
+            secret=data["secret"],
+            qr_payload=data["qr_payload"],
+            expires_at=data.get("expires_at"),
+        )
+    except (PermissionError, LookupError, ValueError) as exc:
+        raise _exc(exc) from exc
+
+
+@shop_org_router.get("/{order_id}/receipt", response_model=SaleReceiptOut)
+def get_shop_customer_sale_receipt(
+    organization_id: UUID,
+    shop_id: UUID,
+    order_id: UUID,
+    user_id: str = Depends(_current_user_id),
+):
+    try:
+        existing = _service.get_org_order(user_id, str(organization_id), str(order_id))
+        _assert_sale_shop(existing, shop_id)
+        row = _service.get_org_order_receipt(
+            user_id,
+            str(organization_id),
+            str(order_id),
+        )
+        return SaleReceiptOut.model_validate(row)
+    except (PermissionError, LookupError, ValueError, RuntimeError) as exc:
+        raise _exc(exc) from exc
+
+
+@shop_org_router.get("/{order_id}/pickup-qr", response_model=QrPayloadOut)
+def get_shop_pickup_qr(
+    organization_id: UUID,
+    shop_id: UUID,
+    order_id: UUID,
+    user_id: str = Depends(_current_user_id),
+):
+    try:
+        existing = _service.get_org_order(user_id, str(organization_id), str(order_id))
+        _assert_sale_shop(existing, shop_id)
+        data = _service.get_pickup_qr_payload(
+            user_id,
+            str(organization_id),
+            str(order_id),
+        )
+        return QrPayloadOut(
+            order_id=UUID(data["order_id"]),
+            organization_id=UUID(data["organization_id"]),
+            secret=data["secret"],
+            qr_payload=data["qr_payload"],
+        )
+    except (PermissionError, LookupError, ValueError) as exc:
+        raise _exc(exc) from exc
+
+
+@shop_org_router.post("/{order_id}/assign-delivery", response_model=SaleOrderDetailOut)
+def assign_shop_delivery_member(
+    organization_id: UUID,
+    shop_id: UUID,
+    order_id: UUID,
+    body: AssignDeliveryBody,
+    user_id: str = Depends(_current_user_id),
+):
+    try:
+        existing = _service.get_org_order(user_id, str(organization_id), str(order_id))
+        _assert_sale_shop(existing, shop_id)
+        row = _service.assign_delivery(
+            user_id,
+            str(organization_id),
+            str(order_id),
+            str(body.member_id),
+        )
+        return _detail_from_row(row)
+    except (PermissionError, LookupError, ValueError) as exc:
+        raise _exc(exc) from exc
+
+
+@shop_org_router.get("/{order_id}/delivery-qr", response_model=QrPayloadOut)
+def get_shop_delivery_qr(
+    organization_id: UUID,
+    shop_id: UUID,
+    order_id: UUID,
+    user_id: str = Depends(_current_user_id),
+):
+    try:
+        existing = _service.get_org_order(user_id, str(organization_id), str(order_id))
+        _assert_sale_shop(existing, shop_id)
+        data = _service.get_delivery_qr_payload(
+            user_id,
+            str(organization_id),
+            str(order_id),
+        )
+        return QrPayloadOut(
+            order_id=UUID(data["order_id"]),
+            organization_id=UUID(data["organization_id"]),
+            secret=data["secret"],
+            qr_payload=data["qr_payload"],
+        )
+    except (PermissionError, LookupError, ValueError) as exc:
         raise _exc(exc) from exc
 
 

@@ -100,7 +100,9 @@ class OrganizationSubscriptionInvoicesResponse(BaseModel):
 class OrganizationSubscriptionOut(BaseModel):
     organization_id: UUID
     plan: OrganizationSubscriptionPlanCode
+    effective_plan: OrganizationSubscriptionPlanCode = OrganizationSubscriptionPlanCode.freemium
     status: OrganizationSubscriptionStatus
+    effective_status: OrganizationSubscriptionStatus
     source: OrganizationSubscriptionSource
     billing_interval: OrganizationSubscriptionBillingInterval = OrganizationSubscriptionBillingInterval.monthly
     current_period_start: Optional[datetime] = None
@@ -114,6 +116,7 @@ class OrganizationSubscriptionOut(BaseModel):
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     plan_details: Optional[OrganizationSubscriptionPlanOut] = None
+    effective_plan_details: Optional[OrganizationSubscriptionPlanOut] = None
 
 
 class OrganizationSubscriptionUsage(BaseModel):
@@ -125,7 +128,9 @@ class OrganizationSubscriptionUsage(BaseModel):
 class OrganizationSubscriptionEntitlements(BaseModel):
     organization_id: UUID
     plan: OrganizationSubscriptionPlanCode
+    effective_plan: OrganizationSubscriptionPlanCode
     status: OrganizationSubscriptionStatus
+    effective_status: OrganizationSubscriptionStatus
     is_active: bool
     features: Dict[str, Any] = Field(default_factory=dict)
     limits: Dict[str, Any] = Field(default_factory=dict)

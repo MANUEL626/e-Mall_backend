@@ -57,8 +57,9 @@ class CustomerAnalyticsService:
     def _get_article(self, article_id: UUID) -> Optional[Dict[str, Any]]:
         res = (
             self.db.table("organization_articles")
-            .select("id, organization_id, category, active")
+            .select("id, organization_id, category, active, resource_scope")
             .eq("id", str(article_id))
+            .eq("resource_scope", "sales_item")
             .limit(1)
             .execute()
         )
@@ -74,6 +75,20 @@ class CustomerAnalyticsService:
             .execute()
         )
         return bool(res.data or [])
+
+    def _assert_sales_shop(self, organization_id: str, shop_id: str) -> None:
+        res = (
+            self.db.table("organization_shops")
+            .select("id")
+            .eq("id", shop_id)
+            .eq("organization_id", organization_id)
+            .eq("shop_type", "sales")
+            .neq("status", "archived")
+            .limit(1)
+            .execute()
+        )
+        if not (res.data or []):
+            raise ValueError("shop_id ne correspond pas a une boutique de vente active")
 
     def _find_recent_duplicate(
         self,
@@ -91,6 +106,11 @@ class CustomerAnalyticsService:
             .order("occurred_at", desc=True)
             .limit(1)
         )
+
+        if payload.get("shop_id"):
+            query = query.eq("shop_id", payload["shop_id"])
+        else:
+            query = query.is_("shop_id", "null")
 
         if payload.get("article_id"):
             query = query.eq("article_id", payload["article_id"])
@@ -128,8 +148,12 @@ class CustomerAnalyticsService:
 
         params = self._get_customer_params_context(customer_id)
         now = datetime.now(timezone.utc)
+        shop_id = str(body.shop_id) if body.shop_id is not None else None
+        if shop_id:
+            self._assert_sales_shop(str(body.organization_id), shop_id)
         payload: Dict[str, Any] = {
             "organization_id": str(body.organization_id),
+            "shop_id": shop_id,
             "article_id": str(body.article_id) if body.article_id else None,
             "customer_id": customer_id,
             "event_type": body.event_type.value,
@@ -212,6 +236,7 @@ class CustomerAnalyticsService:
             payloads.append(
                 {
                     "organization_id": str(order_row["organization_id"]),
+                    "shop_id": str(order_row["shop_id"]) if order_row.get("shop_id") else None,
                     "article_id": article_id,
                     "customer_id": str(order_row["customer_id"]),
                     "event_type": "purchase",

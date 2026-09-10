@@ -8,7 +8,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from features.organization_articles.organization_articles_models import (
     ArticleCategory,
@@ -281,3 +281,4 @@ class PerformanceDashboardSummary(BaseModel):
     sales_status: SalesStatusSummary
     top_products: TopProductsSummary
     trending_products: TrendingProductsSummary
+    activity_summary: Dict[str, Any] = Field(default_factory=dict)

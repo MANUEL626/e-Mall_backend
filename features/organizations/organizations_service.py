@@ -28,7 +28,24 @@ class OrganizationMemberNotFound(Exception):
     """Aucune ligne `members` pour cet id dans cette organisation."""
 
 
+class OrganizationShopNotFound(Exception):
+    """Aucune boutique avec cet identifiant dans cette organisation."""
+
+
 class OrganizationsService:
+    SHOP_SELECT = (
+        "id,organization_id,name,code,description,shop_type,status,is_default,"
+        "country,city,address,longitude,latitude,phone,email,profile_picture,"
+        "settings,created_by_user_id,created_at,updated_at"
+    )
+    MEMBER_SELECT = (
+        "id,user_id,organization_id,member_type,member_role,activity_status,created_at"
+    )
+    MEMBER_USER_SELECT = (
+        "id,email,first_name,last_name,username,user_type,phone,activity_status,"
+        "profile_picture,created_at"
+    )
+
     def __init__(self) -> None:
         self.db: Client = supabase_admin
         self.subscriptions = OrganizationSubscriptionService()
@@ -60,15 +77,38 @@ class OrganizationsService:
 
     @staticmethod
     def _normalize_default_currencies(default_currencies: Optional[Dict[str, Any]]) -> Dict[str, str]:
-        allowed = {"xof", "eur", "usd", "gbp", "cny", "ngn", "ghs"}
-        raw = default_currencies or {}
-        purchase = str(raw.get("purchase") or "eur").strip().lower()
-        sale = str(raw.get("sale") or "xof").strip().lower()
-        if purchase not in allowed:
-            raise ValueError("Devise d'achat non supportee")
-        if sale not in allowed:
-            raise ValueError("Devise de vente non supportee")
-        return {"purchase": purchase, "sale": sale}
+        # V1 produit : devise unique FCFA/XOF. Les champs restent en base
+        # pour une reactivation multi-devise future, mais l'API publique les ignore.
+        return {"purchase": "xof", "sale": "xof"}
+
+    @staticmethod
+    def _normalize_shop_type(shop_type: str) -> str:
+        value = str(shop_type or "").strip().lower()
+        if value not in {"sales", "delivery", "repair", "rental"}:
+            raise ValueError("Type de boutique non supporte")
+        return value
+
+    @staticmethod
+    def _normalize_shop_status(status_value: str) -> str:
+        value = str(status_value or "").strip().lower()
+        if value not in {"active", "inactive", "archived"}:
+            raise ValueError("Statut de boutique non supporte")
+        return value
+
+    @staticmethod
+    def _normalize_optional_text(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        clean = value.strip()
+        return clean or None
+
+    @staticmethod
+    def _default_shop_role_for_member(member_row: Dict[str, Any]) -> str:
+        if member_row.get("member_type") in ("admin", "supervisor"):
+            return "shop_admin"
+        if member_row.get("member_role") == "delivery_management":
+            return "delivery_staff"
+        return "sales_staff"
 
     @staticmethod
     def _auth_error_message(exc: Exception) -> str:
@@ -187,6 +227,11 @@ class OrganizationsService:
             if not rows:
                 raise ValueError("Insertion organisation refusée")
             org_id = rows[0]["id"]
+            default_shop = self._ensure_default_shop(
+                organization_id=str(org_id),
+                created_by_user_id=user_id,
+                shop_type=organization_category,
+            )
         except Exception as exc:
             try:
                 self.db.table("users").delete().eq("id", user_id).execute()
@@ -214,6 +259,7 @@ class OrganizationsService:
             "user_id": user_id,
             "username": username,
             "organization_id": org_id,
+            "default_shop_id": default_shop.get("id") if default_shop else None,
             "organization_profile_picture": org_picture,
             "organization_countries": org_countries,
             "organization_default_currencies": org_default_currencies,
@@ -221,12 +267,245 @@ class OrganizationsService:
             "member_locale": locale,
         }
 
+    def _default_shop_name(self, organization_id: str) -> str:
+        res = (
+            self.db.table("organizations")
+            .select("name")
+            .eq("id", organization_id)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if rows and rows[0].get("name"):
+            return f"{rows[0]['name']} - Boutique principale"
+        return "Boutique principale"
+
+    def _ensure_default_shop(
+        self,
+        organization_id: str,
+        created_by_user_id: Optional[str],
+        shop_type: str,
+    ) -> Dict[str, Any]:
+        existing = (
+            self.db.table("organization_shops")
+            .select("*")
+            .eq("organization_id", organization_id)
+            .eq("is_default", True)
+            .limit(1)
+            .execute()
+        )
+        rows = existing.data or []
+        if rows:
+            shop = rows[0]
+        else:
+            ins = (
+                self.db.table("organization_shops")
+                .insert(
+                    {
+                        "organization_id": organization_id,
+                        "name": self._default_shop_name(organization_id),
+                        "code": "default",
+                        "shop_type": self._normalize_shop_type(shop_type),
+                        "is_default": True,
+                        "status": "active",
+                        "created_by_user_id": created_by_user_id,
+                    }
+                )
+                .execute()
+            )
+            shop_rows = ins.data or []
+            if not shop_rows:
+                raise ValueError("Creation de la boutique par defaut refusee")
+            shop = shop_rows[0]
+
+        if created_by_user_id:
+            member = (
+                self.db.table("members")
+                .select("*")
+                .eq("organization_id", organization_id)
+                .eq("user_id", created_by_user_id)
+                .limit(1)
+                .execute()
+            )
+            member_rows = member.data or []
+            if member_rows:
+                self._ensure_shop_member(
+                    organization_id=organization_id,
+                    shop_id=str(shop["id"]),
+                    member_row=member_rows[0],
+                )
+        return shop
+
+    def _ensure_shop_member(
+        self,
+        organization_id: str,
+        shop_id: str,
+        member_row: Dict[str, Any],
+    ) -> None:
+        try:
+            self.db.table("organization_shop_members").insert(
+                {
+                    "organization_id": organization_id,
+                    "shop_id": shop_id,
+                    "member_id": member_row["id"],
+                    "shop_role": self._default_shop_role_for_member(member_row),
+                    "activity_status": member_row.get("activity_status", True),
+                }
+            ).execute()
+        except Exception as exc:
+            err_l = str(exc).lower()
+            if "duplicate" in err_l or "23505" in err_l:
+                return
+            raise
+
+    def _active_member_row_for_user(
+        self, organization_id: str, user_id: str
+    ) -> Optional[Dict[str, Any]]:
+        res = (
+            self.db.table("members")
+            .select("*")
+            .eq("organization_id", organization_id)
+            .eq("user_id", user_id)
+            .eq("activity_status", True)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        return rows[0] if rows else None
+
+    def _default_shop_id(self, organization_id: str) -> str:
+        res = (
+            self.db.table("organization_shops")
+            .select("id")
+            .eq("organization_id", organization_id)
+            .eq("is_default", True)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if rows:
+            return str(rows[0]["id"])
+        fallback = (
+            self.db.table("organization_shops")
+            .select("id")
+            .eq("organization_id", organization_id)
+            .neq("status", "archived")
+            .order("created_at")
+            .limit(1)
+            .execute()
+        )
+        fallback_rows = fallback.data or []
+        if not fallback_rows:
+            raise OrganizationShopNotFound()
+        return str(fallback_rows[0]["id"])
+
+    def _normalize_shop_ids_for_assignment(
+        self,
+        organization_id: str,
+        shop_ids: Optional[List[str]],
+        *,
+        default_if_empty: bool = True,
+    ) -> List[str]:
+        requested = [str(s).strip() for s in shop_ids or [] if str(s).strip()]
+        if not requested:
+            if not default_if_empty:
+                return []
+            requested = [self._default_shop_id(organization_id)]
+        unique_requested = list(dict.fromkeys(requested))
+        res = (
+            self.db.table("organization_shops")
+            .select("id")
+            .eq("organization_id", organization_id)
+            .neq("status", "archived")
+            .in_("id", unique_requested)
+            .execute()
+        )
+        found = {str(row["id"]) for row in res.data or []}
+        missing = [sid for sid in unique_requested if sid not in found]
+        if missing:
+            raise ValueError("Une ou plusieurs boutiques sont introuvables")
+        return unique_requested
+
+    def _replace_member_shop_assignments(
+        self,
+        organization_id: str,
+        member_row: Dict[str, Any],
+        shop_ids: List[str],
+    ) -> None:
+        member_id = str(member_row["id"])
+        role = self._default_shop_role_for_member(member_row)
+        active = bool(member_row.get("activity_status", True))
+        self.db.table("organization_shop_members").delete().eq(
+            "organization_id", organization_id
+        ).eq("member_id", member_id).execute()
+        if not shop_ids:
+            return
+        payload = [
+            {
+                "organization_id": organization_id,
+                "shop_id": shop_id,
+                "member_id": member_id,
+                "shop_role": role,
+                "activity_status": active,
+            }
+            for shop_id in shop_ids
+        ]
+        self.db.table("organization_shop_members").insert(payload).execute()
+
+    def _sync_member_shop_assignment_metadata(
+        self,
+        organization_id: str,
+        member_row: Dict[str, Any],
+    ) -> None:
+        self.db.table("organization_shop_members").update(
+            {
+                "shop_role": self._default_shop_role_for_member(member_row),
+                "activity_status": bool(member_row.get("activity_status", True)),
+            }
+        ).eq("organization_id", organization_id).eq(
+            "member_id", str(member_row["id"])
+        ).execute()
+
+    def _shops_by_member_id(
+        self,
+        organization_id: str,
+        member_ids: List[str],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        if not member_ids:
+            return {}
+        res = (
+            self.db.table("organization_shop_members")
+            .select("*, organization_shops(*)")
+            .eq("organization_id", organization_id)
+            .in_("member_id", member_ids)
+            .order("created_at")
+            .execute()
+        )
+        out: Dict[str, List[Dict[str, Any]]] = {mid: [] for mid in member_ids}
+        for row in res.data or []:
+            mid = str(row.get("member_id"))
+            shop = row.get("organization_shops") or {}
+            out.setdefault(mid, []).append(
+                {
+                    "id": row.get("id"),
+                    "organization_id": row.get("organization_id"),
+                    "member_id": row.get("member_id"),
+                    "shop_id": row.get("shop_id"),
+                    "shop_role": row.get("shop_role"),
+                    "activity_status": row.get("activity_status"),
+                    "created_at": row.get("created_at"),
+                    "updated_at": row.get("updated_at"),
+                    "shop": shop,
+                }
+            )
+        return out
+
     def _ensure_org_and_inviter(
         self, organization_id: str, inviter_user_id: str
     ) -> Dict[str, Any]:
         ores = (
             self.db.table("organizations")
-            .select("id,org_type")
+            .select("id")
             .eq("id", organization_id)
             .limit(1)
             .execute()
@@ -250,13 +529,201 @@ class OrganizationsService:
             raise OrganizationInviteForbidden()
         return orows[0]
 
-    @staticmethod
-    def _default_member_role_for_org(org_type: str) -> str:
-        return (
-            "delivery_management"
-            if org_type == "delivery"
-            else "sales_management"
+    def _ensure_org_member(self, organization_id: str, actor_user_id: str) -> None:
+        ores = (
+            self.db.table("organizations")
+            .select("id")
+            .eq("id", organization_id)
+            .limit(1)
+            .execute()
         )
+        if not (ores.data or []):
+            raise OrganizationNotFound()
+        mres = (
+            self.db.table("members")
+            .select("id")
+            .eq("user_id", actor_user_id)
+            .eq("organization_id", organization_id)
+            .eq("activity_status", True)
+            .limit(1)
+            .execute()
+        )
+        if not (mres.data or []):
+            raise OrganizationInviteForbidden()
+
+    def list_organization_shops(
+        self,
+        organization_id: str,
+        actor_user_id: str,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        self._ensure_org_member(organization_id, actor_user_id)
+        page_limit = max(1, min(int(limit or 50), 200))
+        page_offset = max(0, int(offset or 0))
+        res = (
+            self.db.table("organization_shops")
+            .select(self.SHOP_SELECT)
+            .eq("organization_id", organization_id)
+            .order("is_default", desc=True)
+            .order("created_at", desc=False)
+            .range(page_offset, page_offset + page_limit - 1)
+            .execute()
+        )
+        return list(res.data or [])
+
+    def get_organization_shop(
+        self,
+        organization_id: str,
+        shop_id: str,
+        actor_user_id: str,
+    ) -> Dict[str, Any]:
+        self._ensure_org_member(organization_id, actor_user_id)
+        res = (
+            self.db.table("organization_shops")
+            .select("*")
+            .eq("organization_id", organization_id)
+            .eq("id", shop_id)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            raise OrganizationShopNotFound()
+        return rows[0]
+
+    def create_organization_shop(
+        self,
+        organization_id: str,
+        actor_user_id: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        self._ensure_org_and_inviter(organization_id, actor_user_id)
+        is_default = bool(payload.get("is_default"))
+        if is_default:
+            self.db.table("organization_shops").update({"is_default": False}).eq(
+                "organization_id", organization_id
+            ).execute()
+
+        row = {
+            "organization_id": organization_id,
+            "name": str(payload["name"]).strip(),
+            "shop_type": self._normalize_shop_type(str(payload["shop_type"])),
+            "code": self._normalize_optional_text(payload.get("code")),
+            "description": self._normalize_optional_text(payload.get("description")),
+            "is_default": is_default,
+            "country": self._normalize_optional_text(payload.get("country")),
+            "city": self._normalize_optional_text(payload.get("city")),
+            "address": self._normalize_optional_text(payload.get("address")),
+            "longitude": payload.get("longitude"),
+            "latitude": payload.get("latitude"),
+            "phone": self._normalize_optional_text(payload.get("phone")),
+            "email": self._normalize_optional_text(payload.get("email")),
+            "profile_picture": self._normalize_optional_text(
+                payload.get("profile_picture")
+            ),
+            "settings": payload.get("settings") or {},
+            "created_by_user_id": actor_user_id,
+        }
+        try:
+            ins = self.db.table("organization_shops").insert(row).execute()
+        except Exception as exc:
+            err_l = str(exc).lower()
+            if "duplicate" in err_l or "23505" in err_l or "unique" in err_l:
+                raise ValueError("Une boutique existe deja avec ce code") from exc
+            raise
+        rows = ins.data or []
+        if not rows:
+            raise ValueError("Creation de boutique refusee")
+        shop = rows[0]
+        actor_member = self._active_member_row_for_user(organization_id, actor_user_id)
+        if actor_member:
+            self._ensure_shop_member(
+                organization_id=organization_id,
+                shop_id=str(shop["id"]),
+                member_row=actor_member,
+            )
+        return shop
+
+    def update_organization_shop(
+        self,
+        organization_id: str,
+        shop_id: str,
+        actor_user_id: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        self._ensure_org_and_inviter(organization_id, actor_user_id)
+        self.get_organization_shop(organization_id, shop_id, actor_user_id)
+
+        updates: Dict[str, Any] = {}
+        if "name" in payload and payload["name"] is not None:
+            updates["name"] = str(payload["name"]).strip()
+        if "shop_type" in payload and payload["shop_type"] is not None:
+            updates["shop_type"] = self._normalize_shop_type(str(payload["shop_type"]))
+        if "status" in payload and payload["status"] is not None:
+            updates["status"] = self._normalize_shop_status(str(payload["status"]))
+        for key in (
+            "code",
+            "description",
+            "country",
+            "city",
+            "address",
+            "phone",
+            "email",
+            "profile_picture",
+        ):
+            if key in payload:
+                updates[key] = self._normalize_optional_text(payload.get(key))
+        for key in ("longitude", "latitude", "settings"):
+            if key in payload:
+                updates[key] = payload.get(key)
+        if "is_default" in payload and payload["is_default"] is not None:
+            updates["is_default"] = bool(payload["is_default"])
+
+        if not updates:
+            raise ValueError("Aucune mise a jour boutique fournie")
+
+        if updates.get("is_default") is True:
+            self.db.table("organization_shops").update({"is_default": False}).eq(
+                "organization_id", organization_id
+            ).neq("id", shop_id).execute()
+
+        try:
+            res = (
+                self.db.table("organization_shops")
+                .update(updates)
+                .eq("organization_id", organization_id)
+                .eq("id", shop_id)
+                .execute()
+            )
+        except Exception as exc:
+            err_l = str(exc).lower()
+            if "duplicate" in err_l or "23505" in err_l or "unique" in err_l:
+                raise ValueError("Une boutique existe deja avec ce code") from exc
+            raise
+        rows = res.data or []
+        if not rows:
+            raise OrganizationShopNotFound()
+        return rows[0]
+
+    def _member_role_for_shop_ids(
+        self,
+        organization_id: str,
+        shop_ids: List[str],
+    ) -> str:
+        if not shop_ids:
+            raise ValueError("Au moins une boutique doit etre fournie")
+        res = (
+            self.db.table("organization_shops")
+            .select("id,shop_type")
+            .eq("organization_id", organization_id)
+            .in_("id", shop_ids)
+            .execute()
+        )
+        shop_types = {str(row.get("shop_type")) for row in res.data or []}
+        if len(shop_types) == 1 and "delivery" in shop_types:
+            return "delivery_management"
+        return "sales_management"
 
     def _find_auth_user_id_by_email(self, email_norm: str) -> Optional[str]:
         page = 1
@@ -320,10 +787,21 @@ class OrganizationsService:
         inviter_user_id: str,
         email: str,
         redirect_to: Optional[str] = None,
+        shop_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         email_norm = email.strip().lower()
-        org = self._ensure_org_and_inviter(organization_id, inviter_user_id)
-        member_role = self._default_member_role_for_org(str(org.get("org_type", "sales")))
+        self._ensure_org_and_inviter(organization_id, inviter_user_id)
+        assignment_shop_ids = self._normalize_shop_ids_for_assignment(
+            organization_id,
+            shop_ids,
+            default_if_empty=False,
+        )
+        if not assignment_shop_ids:
+            raise ValueError("shop_ids est requis pour inviter un membre")
+        member_role = self._member_role_for_shop_ids(
+            organization_id,
+            assignment_shop_ids,
+        )
 
         invite_options: Optional[Dict[str, Any]] = None
         if redirect_to and redirect_to.strip():
@@ -433,6 +911,7 @@ class OrganizationsService:
             )
             if not mins.data:
                 raise ValueError("Ajout du membre refusé")
+            member_row = mins.data[0]
         except Exception as exc:
             err_l = str(exc).lower()
             if "duplicate" in err_l or "23505" in err_l:
@@ -449,6 +928,12 @@ class OrganizationsService:
                 except Exception:
                     pass
             raise ValueError("Impossible d’ajouter le membre à l’organisation") from exc
+
+        self._replace_member_shop_assignments(
+            organization_id,
+            member_row,
+            assignment_shop_ids,
+        )
 
         try:
             self.db.table("member_params").insert(
@@ -475,6 +960,7 @@ class OrganizationsService:
             "user_id": invited_user_id,
             "email": email_norm,
             "organization_id": organization_id,
+            "shop_ids": assignment_shop_ids,
         }
 
     def _count_active_admins_excluding(
@@ -494,28 +980,48 @@ class OrganizationsService:
         return len(rows)
 
     def list_organization_members(
-        self, organization_id: str, actor_user_id: str
+        self,
+        organization_id: str,
+        actor_user_id: str,
+        limit: int = 50,
+        offset: int = 0,
     ) -> Dict[str, Any]:
         self._ensure_org_and_inviter(organization_id, actor_user_id)
+        page_limit = max(1, min(int(limit or 50), 200))
+        page_offset = max(0, int(offset or 0))
         mres = (
             self.db.table("members")
-            .select("*")
+            .select(self.MEMBER_SELECT)
             .eq("organization_id", organization_id)
             .order("created_at", desc=False)
+            .range(page_offset, page_offset + page_limit - 1)
             .execute()
         )
         rows = mres.data or []
+        member_ids = [str(r["id"]) for r in rows]
         user_ids = list({str(r["user_id"]) for r in rows})
         users_by_id: Dict[str, Dict[str, Any]] = {}
         if user_ids:
-            ures = self.db.table("users").select("*").in_("id", user_ids).execute()
+            ures = (
+                self.db.table("users")
+                .select(self.MEMBER_USER_SELECT)
+                .in_("id", user_ids)
+                .execute()
+            )
             for u in ures.data or []:
                 users_by_id[str(u["id"])] = u
+        shops_by_member = self._shops_by_member_id(organization_id, member_ids)
         members_out: List[Dict[str, Any]] = []
         for r in rows:
             uid = str(r["user_id"])
             u = users_by_id.get(uid, {})
-            members_out.append({**r, "user": u})
+            members_out.append(
+                {
+                    **r,
+                    "user": u,
+                    "shops": shops_by_member.get(str(r["id"]), []),
+                }
+            )
         return {"members": members_out}
 
     def update_organization_profile(
@@ -593,6 +1099,7 @@ class OrganizationsService:
         activity_status: Optional[bool] = None,
         member_type: Optional[str] = None,
         member_role: Optional[str] = None,
+        shop_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         self._ensure_org_and_inviter(organization_id, actor_user_id)
         pres = (
@@ -651,15 +1158,19 @@ class OrganizationsService:
             except OrganizationSubscriptionLimitExceeded as exc:
                 raise ValueError(str(exc)) from exc
 
-        ures = (
-            self.db.table("members")
-            .update(updates)
-            .eq("id", member_id)
-            .eq("organization_id", organization_id)
-            .execute()
-        )
-        urows = ures.data or []
-        updated = urows[0] if urows else None
+        if updates:
+            ures = (
+                self.db.table("members")
+                .update(updates)
+                .eq("id", member_id)
+                .eq("organization_id", organization_id)
+                .execute()
+            )
+            urows = ures.data or []
+            updated = urows[0] if urows else None
+        else:
+            updated = None
+
         if not updated:
             ref = (
                 self.db.table("members")
@@ -674,9 +1185,27 @@ class OrganizationsService:
                 raise OrganizationMemberNotFound()
             updated = r2[0]
 
+        if shop_ids is not None:
+            assignment_shop_ids = self._normalize_shop_ids_for_assignment(
+                organization_id,
+                shop_ids,
+                default_if_empty=False,
+            )
+            self._replace_member_shop_assignments(
+                organization_id,
+                updated,
+                assignment_shop_ids,
+            )
+        elif updates:
+            self._sync_member_shop_assignment_metadata(organization_id, updated)
+
         uid = str(updated["user_id"])
         ufetch = (
             self.db.table("users").select("*").eq("id", uid).limit(1).execute()
         )
         urow = (ufetch.data or [{}])[0]
-        return {**updated, "user": urow}
+        shops = self._shops_by_member_id(organization_id, [str(updated["id"])]).get(
+            str(updated["id"]),
+            [],
+        )
+        return {**updated, "user": urow, "shops": shops}

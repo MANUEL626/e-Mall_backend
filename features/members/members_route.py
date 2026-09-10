@@ -7,6 +7,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from config.supabase_client import is_supabase_transport_error
 from features.auth.auth_service import AuthService
 from features.customers.customer_subscriptions_models import (
     MemberSubscriberItem,
@@ -81,6 +82,19 @@ def get_current_member_profile(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Ce compte n'est pas un membre d'organisation",
         ) from exc
+    except Exception as exc:
+        if is_supabase_transport_error(exc):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "supabase_unavailable",
+                    "message": (
+                        "Impossible de charger le profil membre pour le moment. "
+                        "Veuillez reessayer dans quelques secondes."
+                    ),
+                },
+            ) from exc
+        raise
 
 
 @router.patch("/me/profile")

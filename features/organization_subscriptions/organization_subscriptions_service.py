@@ -42,9 +42,45 @@ class OrganizationSubscriptionPaymentError(Exception):
 
 class OrganizationSubscriptionService:
     ACTIVE_STATUSES = {"active", "trialing"}
+    KNOWN_FEATURE_KEYS = {
+        "basic_catalog",
+        "simple_stock",
+        "walk_in_sales",
+        "article_posts",
+        "supplier_orders",
+        "pickup_delivery",
+        "delivery_assignment",
+        "delivery_status_history",
+        "ai_performance_agent",
+        "team_customer_messaging",
+        "advanced_roles",
+        "realtime_gps",
+        "priority_support",
+        "multi_shops",
+        "sales_shops",
+        "delivery_shops",
+        "repair_shops",
+        "rental_shops",
+        "repair_domain",
+        "rental_domain",
+        "rental_asset_posts",
+        "delivery_realtime_ws",
+        "sale_receipts",
+        "repair_invoices",
+        "subscription_invoices",
+    }
     _plans_cache: Optional[tuple[datetime, List[Dict[str, Any]]]] = None
     _plan_cache_ttl = timedelta(minutes=5)
     _stripe_api_base = "https://api.stripe.com/v1"
+
+    @staticmethod
+    def ai_reports_enabled() -> bool:
+        return os.getenv("AI_REPORTS_ENABLED", "false").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
     def __init__(self) -> None:
         self.db: Client = supabase_admin
@@ -93,6 +129,13 @@ class OrganizationSubscriptionService:
     @classmethod
     def _enrich_plan_pricing(cls, plan: Dict[str, Any]) -> Dict[str, Any]:
         row = dict(plan)
+        plan_code = str(row.get("code") or "").upper()
+        monthly_price_id = os.getenv(f"STRIPE_{plan_code}_MONTHLY_PRICE_ID", "").strip()
+        yearly_price_id = os.getenv(f"STRIPE_{plan_code}_YEARLY_PRICE_ID", "").strip()
+        if monthly_price_id:
+            row["stripe_monthly_price_id"] = monthly_price_id
+        if yearly_price_id:
+            row["stripe_yearly_price_id"] = yearly_price_id
         monthly = cls._decimal_or_none(row.get("monthly_price_amount"))
         yearly = cls._decimal_or_none(row.get("yearly_price_amount"))
         yearly_full_price = monthly * Decimal("12") if monthly is not None else None
@@ -142,11 +185,17 @@ class OrganizationSubscriptionService:
                 return row
         return None
 
-    @staticmethod
+    @classmethod
     def _stripe_price_id_for_interval(
+        cls,
         plan: Dict[str, Any],
         billing_interval: str,
     ) -> Optional[str]:
+        plan_code = str(plan.get("code") or "").upper()
+        interval_name = "YEARLY" if billing_interval == "yearly" else "MONTHLY"
+        env_price_id = os.getenv(f"STRIPE_{plan_code}_{interval_name}_PRICE_ID", "").strip()
+        if env_price_id:
+            return env_price_id
         if billing_interval == "yearly":
             return plan.get("stripe_yearly_price_id")
         return plan.get("stripe_monthly_price_id")
@@ -159,6 +208,54 @@ class OrganizationSubscriptionService:
             return datetime.fromtimestamp(int(value), tz=timezone.utc).isoformat()
         except (TypeError, ValueError, OSError):
             return None
+
+    @staticmethod
+    def _parse_datetime(value: Any) -> Optional[datetime]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            text = str(value).strip()
+            if not text:
+                return None
+            if text.endswith("Z"):
+                text = f"{text[:-1]}+00:00"
+            try:
+                parsed = datetime.fromisoformat(text)
+            except ValueError:
+                return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _effective_status(self, subscription: Dict[str, Any]) -> str:
+        status = str(subscription.get("status") or "expired")
+        if status not in self.ACTIVE_STATUSES:
+            return status
+
+        period_end = self._parse_datetime(subscription.get("current_period_end"))
+        if period_end is not None and period_end < datetime.now(timezone.utc):
+            return "expired"
+
+        return status
+
+    def _effective_plan_code(self, subscription: Dict[str, Any]) -> str:
+        if self._effective_status(subscription) not in self.ACTIVE_STATUSES:
+            return "freemium"
+        plan_code = str(subscription.get("plan") or "freemium")
+        return plan_code if self._get_plan(plan_code) is not None else "freemium"
+
+    def _decorate_subscription(self, subscription: Dict[str, Any]) -> Dict[str, Any]:
+        plan_code = str(subscription.get("plan") or "freemium")
+        effective_plan = self._effective_plan_code(subscription)
+        return {
+            **subscription,
+            "effective_plan": effective_plan,
+            "effective_status": self._effective_status(subscription),
+            "plan_details": self._get_plan(plan_code),
+            "effective_plan_details": self._get_plan(effective_plan),
+        }
 
     @staticmethod
     def _stripe_status_to_internal(status: str) -> str:
@@ -222,6 +319,218 @@ class OrganizationSubscriptionService:
                 "Reponse Stripe invalide"
             ) from exc
 
+    def _retrieve_price(self, price_id: str) -> Dict[str, Any]:
+        return self._stripe_request("GET", f"/prices/{price_id}")
+
+    @staticmethod
+    def _checkout_success_url(success_url: str) -> str:
+        if "{CHECKOUT_SESSION_ID}" in success_url:
+            return success_url
+        separator = "&" if "?" in success_url else "?"
+        return f"{success_url}{separator}stripe_checkout_session_id={{CHECKOUT_SESSION_ID}}"
+
+    def _stripe_price_currency(self, price_id: Optional[str]) -> Optional[str]:
+        if not price_id:
+            return None
+        price = self._retrieve_price(str(price_id))
+        currency = price.get("currency")
+        return str(currency).lower() if currency else None
+
+    def _expire_open_checkout_sessions(self, stripe_customer_id: str) -> None:
+        query = urlencode({"customer": stripe_customer_id, "limit": 20})
+        payload = self._stripe_request("GET", f"/checkout/sessions?{query}")
+        for session in payload.get("data") or []:
+            if (
+                session.get("mode") == "subscription"
+                and session.get("status") == "open"
+                and session.get("id")
+            ):
+                self._stripe_request(
+                    "POST",
+                    f"/checkout/sessions/{session['id']}/expire",
+                )
+
+    def _current_stripe_subscription_price_id(
+        self,
+        subscription: Dict[str, Any],
+    ) -> Optional[str]:
+        price_id = subscription.get("stripe_price_id")
+        if price_id:
+            return str(price_id)
+        stripe_subscription_id = subscription.get("stripe_subscription_id")
+        if not stripe_subscription_id:
+            return None
+        remote_subscription = self._retrieve_subscription(str(stripe_subscription_id))
+        item_rows = ((remote_subscription.get("items") or {}).get("data") or [])
+        if not item_rows:
+            return None
+        price = item_rows[0].get("price") or {}
+        return str(price.get("id")) if price.get("id") else None
+
+    def _retrieve_checkout_session(self, checkout_session_id: str) -> Dict[str, Any]:
+        query = urlencode({"expand[]": "subscription"})
+        return self._stripe_request(
+            "GET",
+            f"/checkout/sessions/{checkout_session_id}?{query}",
+        )
+
+    def _list_customer_subscriptions(
+        self,
+        stripe_customer_id: str,
+    ) -> List[Dict[str, Any]]:
+        query = urlencode(
+            {
+                "customer": stripe_customer_id,
+                "status": "all",
+                "limit": 20,
+                "expand[]": "data.items.data.price",
+            }
+        )
+        payload = self._stripe_request("GET", f"/subscriptions?{query}")
+        return list(payload.get("data") or [])
+
+    @staticmethod
+    def _stripe_subscription_sort_key(subscription: Dict[str, Any]) -> int:
+        for key in ("current_period_end", "created"):
+            try:
+                return int(subscription.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    def _latest_customer_subscription_for_org(
+        self,
+        stripe_customer_id: str,
+        organization_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        rows = [
+            row
+            for row in self._list_customer_subscriptions(stripe_customer_id)
+            if str((row.get("metadata") or {}).get("organization_id") or "")
+            == organization_id
+        ]
+        if not rows:
+            return None
+
+        active_rows = [
+            row
+            for row in rows
+            if self._stripe_status_to_internal(str(row.get("status") or ""))
+            in self.ACTIVE_STATUSES
+        ]
+        candidates = active_rows or rows
+        return sorted(
+            candidates,
+            key=self._stripe_subscription_sort_key,
+            reverse=True,
+        )[0]
+
+    def sync_checkout_session(
+        self,
+        organization_id: str,
+        checkout_session_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        session = self._retrieve_checkout_session(checkout_session_id)
+        session_org_id = str(
+            session.get("client_reference_id")
+            or (session.get("metadata") or {}).get("organization_id")
+            or ""
+        )
+        if session_org_id != organization_id:
+            raise OrganizationSubscriptionPaymentError(
+                "Session Stripe invalide pour cette organisation"
+            )
+        if session.get("mode") != "subscription":
+            raise OrganizationSubscriptionPaymentError(
+                "Session Stripe non liee a un abonnement"
+            )
+        if session.get("status") != "complete":
+            raise OrganizationSubscriptionPaymentError(
+                "Paiement Stripe non finalise"
+            )
+
+        stripe_subscription = session.get("subscription")
+        if isinstance(stripe_subscription, dict):
+            subscription_id = stripe_subscription.get("id")
+        else:
+            subscription_id = stripe_subscription
+        if not subscription_id:
+            raise OrganizationSubscriptionPaymentError(
+                "Abonnement Stripe introuvable pour cette session"
+            )
+        return self.sync_stripe_subscription(
+            self._retrieve_subscription(str(subscription_id))
+        )
+
+    def _refresh_stripe_subscription_if_needed(
+        self,
+        organization_id: str,
+        subscription: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not (
+            subscription.get("stripe_subscription_id")
+            or subscription.get("stripe_customer_id")
+        ):
+            return subscription
+
+        should_refresh = (
+            subscription.get("source") == "stripe"
+            and (
+                subscription.get("status") not in self.ACTIVE_STATUSES
+                or self._effective_status(subscription) not in self.ACTIVE_STATUSES
+                or not subscription.get("current_period_end")
+            )
+        )
+        if not should_refresh:
+            return subscription
+
+        synced: Optional[Dict[str, Any]] = None
+        stripe_subscription_id = subscription.get("stripe_subscription_id")
+        if stripe_subscription_id:
+            synced = self.sync_stripe_subscription(
+                self._retrieve_subscription(str(stripe_subscription_id))
+            )
+
+        if synced and synced.get("effective_status") in self.ACTIVE_STATUSES:
+            return synced
+
+        stripe_customer_id = subscription.get("stripe_customer_id")
+        if stripe_customer_id:
+            latest = self._latest_customer_subscription_for_org(
+                str(stripe_customer_id),
+                organization_id,
+            )
+            if latest is not None:
+                synced = self.sync_stripe_subscription(latest)
+                if synced:
+                    return synced
+
+        return subscription
+
+    def _assert_checkout_currency_compatible(
+        self,
+        subscription: Dict[str, Any],
+        target_price_id: str,
+    ) -> None:
+        stripe_customer_id = subscription.get("stripe_customer_id")
+        if not stripe_customer_id:
+            return
+
+        self._expire_open_checkout_sessions(str(stripe_customer_id))
+        if subscription.get("status") not in {"active", "trialing", "past_due"}:
+            return
+
+        current_price_id = self._current_stripe_subscription_price_id(subscription)
+        current_currency = self._stripe_price_currency(current_price_id)
+        target_currency = self._stripe_price_currency(target_price_id)
+        if current_currency and target_currency and current_currency != target_currency:
+            raise OrganizationSubscriptionPaymentError(
+                "Stripe refuse de melanger plusieurs devises sur un meme customer. "
+                f"L'abonnement actif est en {current_currency}, le nouveau price est en "
+                f"{target_currency}. Configure les prices Standard/Premium mensuel/annuel "
+                "dans la meme devise, ou annule l'abonnement actif avant de changer de devise."
+            )
+
     def _get_user_email(self, user_id: str) -> Optional[str]:
         res = (
             self.db.table("users")
@@ -238,9 +547,9 @@ class OrganizationSubscriptionService:
 
     def _plan_for_price_id(self, price_id: str) -> Optional[Dict[str, str]]:
         for plan in self.list_plans():
-            if plan.get("stripe_monthly_price_id") == price_id:
+            if self._stripe_price_id_for_interval(plan, "monthly") == price_id:
                 return {"plan": str(plan.get("code")), "billing_interval": "monthly"}
-            if plan.get("stripe_yearly_price_id") == price_id:
+            if self._stripe_price_id_for_interval(plan, "yearly") == price_id:
                 return {"plan": str(plan.get("code")), "billing_interval": "yearly"}
         return None
 
@@ -266,6 +575,7 @@ class OrganizationSubscriptionService:
             raise ValueError("Price Stripe non configure pour ce plan et ce cycle")
 
         subscription = self._ensure_subscription(organization_id)
+        self._assert_checkout_currency_compatible(subscription, str(price_id))
         success_url = os.getenv("STRIPE_SUCCESS_URL", "").strip()
         cancel_url = os.getenv("STRIPE_CANCEL_URL", "").strip()
         if not success_url or not cancel_url:
@@ -275,7 +585,7 @@ class OrganizationSubscriptionService:
 
         data: Dict[str, Any] = {
             "mode": "subscription",
-            "success_url": success_url,
+            "success_url": self._checkout_success_url(success_url),
             "cancel_url": cancel_url,
             "client_reference_id": organization_id,
             "line_items[0][price]": price_id,
@@ -455,8 +765,7 @@ class OrganizationSubscriptionService:
         rows = res.data or []
         if not rows:
             return None
-        plan = self._get_plan(str(rows[0].get("plan")))
-        return {**rows[0], "plan_details": plan}
+        return self._decorate_subscription(rows[0])
 
     def verify_stripe_signature(self, payload: bytes, signature_header: str) -> None:
         secret = self._stripe_webhook_secret()
@@ -575,11 +884,20 @@ class OrganizationSubscriptionService:
         self,
         user_id: str,
         organization_id: str,
+        *,
+        checkout_session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         self.assert_org_member(user_id, organization_id)
+        if checkout_session_id:
+            synced = self.sync_checkout_session(organization_id, checkout_session_id)
+            if synced:
+                return synced
         subscription = self._ensure_subscription(organization_id)
-        plan = self._get_plan(str(subscription.get("plan")))
-        return {**subscription, "plan_details": plan}
+        subscription = self._refresh_stripe_subscription_if_needed(
+            organization_id,
+            subscription,
+        )
+        return self._decorate_subscription(subscription)
 
     def update_subscription(
         self,
@@ -626,8 +944,7 @@ class OrganizationSubscriptionService:
         rows = res.data or []
         if not rows:
             raise OrganizationSubscriptionNotFound()
-        plan = self._get_plan(str(rows[0].get("plan")))
-        return {**rows[0], "plan_details": plan}
+        return self._decorate_subscription(rows[0])
 
     def _count_active_articles(self, organization_id: str) -> int:
         res = (
@@ -635,6 +952,7 @@ class OrganizationSubscriptionService:
             .select("id", count="exact")
             .eq("organization_id", organization_id)
             .eq("active", True)
+            .eq("resource_scope", "sales_item")
             .limit(1)
             .execute()
         )
@@ -687,16 +1005,25 @@ class OrganizationSubscriptionService:
         self,
         user_id: str,
         organization_id: str,
+        *,
+        checkout_session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        subscription = self.get_subscription(user_id, organization_id)
+        subscription = self.get_subscription(
+            user_id,
+            organization_id,
+            checkout_session_id=checkout_session_id,
+        )
         return self._build_entitlements(organization_id, subscription)
 
     def get_entitlements_for_org(self, organization_id: str) -> Dict[str, Any]:
         subscription = self._ensure_subscription(organization_id)
-        plan = self._get_plan(str(subscription.get("plan")))
+        subscription = self._refresh_stripe_subscription_if_needed(
+            organization_id,
+            subscription,
+        )
         return self._build_entitlements(
             organization_id,
-            {**subscription, "plan_details": plan},
+            self._decorate_subscription(subscription),
         )
 
     def _build_entitlements(
@@ -704,8 +1031,17 @@ class OrganizationSubscriptionService:
         organization_id: str,
         subscription: Dict[str, Any],
     ) -> Dict[str, Any]:
-        plan = subscription.get("plan_details") or {}
-        features = plan.get("features") or {}
+        subscription = self._decorate_subscription(subscription)
+        plan = subscription.get("effective_plan_details") or {}
+        plan_code = str(subscription.get("effective_plan") or plan.get("code") or "")
+        features = dict(plan.get("features") or {})
+        if plan_code == "premium":
+            for key in self.KNOWN_FEATURE_KEYS:
+                features[key] = True
+            features["sales_dashboard"] = "advanced"
+        features["advanced_reports"] = True
+        if not self.ai_reports_enabled():
+            features["ai_performance_agent"] = False
         limits = plan.get("limits") or {}
         usage = {
             "active_articles": self._count_active_articles(organization_id),
@@ -719,8 +1055,10 @@ class OrganizationSubscriptionService:
         return {
             "organization_id": organization_id,
             "plan": subscription.get("plan"),
+            "effective_plan": subscription.get("effective_plan"),
             "status": subscription.get("status"),
-            "is_active": subscription.get("status") in self.ACTIVE_STATUSES,
+            "effective_status": subscription.get("effective_status"),
+            "is_active": subscription.get("effective_status") in self.ACTIVE_STATUSES,
             "features": features,
             "limits": limits,
             "usage": usage,
@@ -729,12 +1067,22 @@ class OrganizationSubscriptionService:
         }
 
     def assert_feature_enabled(self, organization_id: str, feature: str) -> None:
-        subscription = self._ensure_subscription(organization_id)
-        if subscription.get("status") not in self.ACTIVE_STATUSES:
+        subscription = self._refresh_stripe_subscription_if_needed(
+            organization_id,
+            self._ensure_subscription(organization_id),
+        )
+        subscription = self._decorate_subscription(subscription)
+        if subscription.get("effective_status") not in self.ACTIVE_STATUSES:
             raise OrganizationSubscriptionFeatureDenied(
                 "Abonnement inactif pour cette organisation"
             )
-        plan = self._get_plan(str(subscription.get("plan"))) or {}
+        if feature == "ai_performance_agent" and not self.ai_reports_enabled():
+            raise OrganizationSubscriptionFeatureDenied(
+                "Rapport IA indisponible en V1"
+            )
+        plan = subscription.get("effective_plan_details") or {}
+        if str(subscription.get("effective_plan")) == "premium":
+            return
         value = (plan.get("features") or {}).get(feature)
         if value is not True:
             raise OrganizationSubscriptionFeatureDenied(
@@ -748,12 +1096,16 @@ class OrganizationSubscriptionService:
         *,
         increment: int = 1,
     ) -> None:
-        subscription = self._ensure_subscription(organization_id)
-        if subscription.get("status") not in self.ACTIVE_STATUSES:
+        subscription = self._refresh_stripe_subscription_if_needed(
+            organization_id,
+            self._ensure_subscription(organization_id),
+        )
+        subscription = self._decorate_subscription(subscription)
+        if subscription.get("effective_status") not in self.ACTIVE_STATUSES:
             raise OrganizationSubscriptionLimitExceeded(
                 "Abonnement inactif pour cette organisation"
             )
-        plan = self._get_plan(str(subscription.get("plan"))) or {}
+        plan = subscription.get("effective_plan_details") or {}
         limits = plan.get("limits") or {}
         limit_value = limits.get(limit_key)
         if limit_value is None:

@@ -7,6 +7,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from config.supabase_client import is_supabase_transport_error
 from features.auth.auth_service import AuthService
 from features.organization_subscriptions.organization_subscriptions_models import (
     OrganizationSubscriptionCheckoutCreate,
@@ -65,13 +66,18 @@ def list_subscription_plans(
 )
 def get_organization_subscription(
     organization_id: UUID,
+    stripe_checkout_session_id: str | None = Query(None),
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
     """Retourne l'abonnement interne de l'organisation."""
 
     user_id = _current_user_id(credentials)
     try:
-        payload = _service.get_subscription(user_id, str(organization_id))
+        payload = _service.get_subscription(
+            user_id,
+            str(organization_id),
+            checkout_session_id=stripe_checkout_session_id,
+        )
         return OrganizationSubscriptionOut.model_validate(payload)
     except OrganizationSubscriptionNotFound as exc:
         raise HTTPException(
@@ -83,6 +89,24 @@ def get_organization_subscription(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=str(exc),
         ) from exc
+    except OrganizationSubscriptionPaymentError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        if is_supabase_transport_error(exc):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "supabase_unavailable",
+                    "message": (
+                        "Impossible de charger les droits de l'organisation "
+                        "pour le moment. Veuillez reessayer dans quelques secondes."
+                    ),
+                },
+            ) from exc
+        raise
 
 
 @router.get(
@@ -91,13 +115,18 @@ def get_organization_subscription(
 )
 def get_organization_entitlements(
     organization_id: UUID,
+    stripe_checkout_session_id: str | None = Query(None),
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
     """Retourne les droits effectifs, limites et usages pour le front."""
 
     user_id = _current_user_id(credentials)
     try:
-        payload = _service.get_entitlements(user_id, str(organization_id))
+        payload = _service.get_entitlements(
+            user_id,
+            str(organization_id),
+            checkout_session_id=stripe_checkout_session_id,
+        )
         return OrganizationSubscriptionEntitlements.model_validate(payload)
     except OrganizationSubscriptionNotFound as exc:
         raise HTTPException(
@@ -109,6 +138,24 @@ def get_organization_entitlements(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=str(exc),
         ) from exc
+    except OrganizationSubscriptionPaymentError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        if is_supabase_transport_error(exc):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "supabase_unavailable",
+                    "message": (
+                        "Impossible de charger les droits de l'organisation "
+                        "pour le moment. Veuillez reessayer dans quelques secondes."
+                    ),
+                },
+            ) from exc
+        raise
 
 
 @router.patch(
